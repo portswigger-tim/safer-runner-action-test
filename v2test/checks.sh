@@ -17,7 +17,7 @@ must_pass() {
   done
   record A.env PASS "CA env vars exported via GITHUB_ENV (NODE_EXTRA_CA_CERTS=$NODE_EXTRA_CA_CERTS)"
 
-  code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/zen 2>&1)
+  code=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
   issuer=$(echo | timeout 15 openssl s_client -connect api.github.com:443 -servername api.github.com 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)
   [ "$code" = 200 ] && grep -q safer-runner <<<"$issuer"
   pass_if A.curl $? "https://api.github.com/zen -> $code, cert $issuer"
@@ -131,7 +131,7 @@ sudo_must_fail() {
   # H1, addon layer alone: /etc/hosts makes the PROXY resolve allowlisted names to internal
   # addresses without dnsmasq (whose stop-dns-rebind would otherwise refuse them first). The
   # client dials a public IP, so the only thing that can refuse is the proxy's IP guard.
-  printf '169.254.169.254 imds-hosts.nip.io\n127.0.0.1 lo-hosts.nip.io\n10.0.0.1 rfc1918-hosts.nip.io\nfd00::1 ula-hosts.nip.io\n' | sudo tee -a /etc/hosts >/dev/null
+  printf '169.254.169.254 imds-hosts.nip.io\n127.0.0.1 lo-hosts.nip.io\n10.0.0.1 rfc1918-hosts.nip.io\nfd00::1 ula-hosts.nip.io\n169.254.169.254 pt-hosts.sslip.io\n' | sudo tee -a /etc/hosts >/dev/null
   local n ip
   for pair in imds-hosts:169.254.169.254 lo-hosts:127.0.0.1 rfc1918-hosts:10.0.0.1; do
     n="${pair%%:*}.nip.io"; ip="${pair#*:}"
@@ -142,16 +142,19 @@ sudo_must_fail() {
       ".ev==\"upstream\" and .host==\"$n\" and .verdict==\"BLOCK\"" \
       curl -k -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "$n:443:$ATTACKER_IP" "https://$n/"
   done
+  expect_upstream_refused "H1.guard-passthrough-imds" "proxy resolves passthrough name pt-hosts.sslip.io -> 169.254.169.254 (/etc/hosts)" 169.254.169.254 \
+    '.ev=="upstream" and .host=="pt-hosts.sslip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden"' \
+    curl -k -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "pt-hosts.sslip.io:443:$ATTACKER_IP" https://pt-hosts.sslip.io/
   expect_upstream_refused "H1.guard-ula" "proxy resolves ula-hosts.nip.io -> fd00::1 (/etc/hosts)" "" \
     '.ev=="upstream" and .host=="ula-hosts.nip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden"' \
     curl -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "ula-hosts.nip.io:80:$ATTACKER_IP" http://ula-hosts.nip.io/
-  sudo sed -i '/-hosts\.nip\.io$/d' /etc/hosts
+  sudo sed -i '/-hosts\.\(nip\|sslip\)\.io$/d' /etc/hosts
 
   # Proxy crash: systemd restarts it (same CA from tmpfs) and traffic recovers (GA gate preview)
   sudo systemctl kill -s KILL safer-runner-proxy
   t0=$(date +%s.%N)
   for _ in $(seq 1 30); do
-    code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' https://api.github.com/zen 2>/dev/null) && [ "$code" = 200 ] && break
+    code=$(gh_zen -m 5 -o /dev/null -w '%{http_code}' 2>/dev/null) && [ "$code" = 200 ] && break
     sleep 0.5
   done
   record X.proxy-kill-recovery INFO "SIGKILL -> api.github.com $code after $(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')s; restarts=$(systemctl show -p NRestarts --value safer-runner-proxy)"
@@ -188,17 +191,21 @@ ssrf() {
     '.ev=="upstream" and .host=="10.0.0.1.nip.io" and .verdict=="BLOCK"' \
     curl -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "10.0.0.1.nip.io:80:$ATTACKER_IP" http://10.0.0.1.nip.io/
 
-  # addon layer: CGNAT is NOT covered by stop-dns-rebind, so only the proxy's IP guard stops it
-  expect_upstream_refused H1.guard-cgnat-http "http://100.64.0.1.nip.io/ (resolves to CGNAT)" 100.64.0.1 \
-    '.ev=="upstream" and .host=="100.64.0.1.nip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden"' \
-    curl -sS -m 10 -o /dev/null -w '%{http_code}' http://100.64.0.1.nip.io/
-  expect_upstream_refused H1.guard-cgnat-https "https://100.64.0.1.nip.io/ (intercept)" 100.64.0.1 \
-    '.ev=="upstream" and .host=="100.64.0.1.nip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden"' \
-    curl -k -sS -m 10 -o /dev/null -w '%{http_code}' https://100.64.0.1.nip.io/
+  # CGNAT: dnsmasq 2.91 (24.04) passes 100.64/10 answers, 2.92 (26.04) drops them too. The client
+  # dials a public IP (--resolve), so whichever layer refuses, the proxy must log a BLOCK and
+  # never connect to 100.64.0.1 (reason upstream-ip-forbidden on 2.91, upstream-unresolved on 2.92).
+  out=$(dig +short +time=3 +tries=2 @127.0.0.1 100.64.0.1.nip.io A 2>&1)
+  record H1.dns-cgnat INFO "dig 100.64.0.1.nip.io -> '${out:-<dropped by dnsmasq>}' ($(grep -m1 -o 'started, version [0-9.]*' /var/log/safer-runner/dns.log))"
+  expect_upstream_refused H1.guard-cgnat-http "Host 100.64.0.1.nip.io dialled at $ATTACKER_IP (plain HTTP)" 100.64.0.1 \
+    '.ev=="upstream" and .host=="100.64.0.1.nip.io" and .verdict=="BLOCK"' \
+    curl -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "100.64.0.1.nip.io:80:$ATTACKER_IP" http://100.64.0.1.nip.io/
+  expect_upstream_refused H1.guard-cgnat-https "SNI 100.64.0.1.nip.io dialled at $ATTACKER_IP (intercept)" 100.64.0.1 \
+    '.ev=="upstream" and .host=="100.64.0.1.nip.io" and .verdict=="BLOCK"' \
+    curl -k -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "100.64.0.1.nip.io:443:$ATTACKER_IP" https://100.64.0.1.nip.io/
   # passthrough connections get the same guard (100-64-0-1.sslip.io is a passthrough-domain here)
-  expect_upstream_refused H1.guard-cgnat-passthrough "https://100-64-0-1.sslip.io/ (passthrough, SNI only)" 100.64.0.1 \
-    '.ev=="upstream" and .host=="100-64-0-1.sslip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden"' \
-    curl -k -sS -m 10 -o /dev/null -w '%{http_code}' https://100-64-0-1.sslip.io/
+  expect_upstream_refused H1.guard-cgnat-passthrough "SNI 100-64-0-1.sslip.io dialled at $ATTACKER_IP (passthrough, SNI only)" 100.64.0.1 \
+    '.ev=="upstream" and .host=="100-64-0-1.sslip.io" and .verdict=="BLOCK"' \
+    curl -k -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "100-64-0-1.sslip.io:443:$ATTACKER_IP" https://100-64-0-1.sslip.io/
 
   # legitimate: a public answer under the same allowlisted suffix is connected to (and pinned)
   local m rec; m=$(mark)
@@ -222,7 +229,7 @@ privilege() { # privilege <expect-sudo: yes|no>
     out=$(kill -9 "$(systemctl show -p MainPID --value safer-runner-proxy)" 2>&1); rc=$?
     [ $rc -ne 0 ] && systemctl is-active -q safer-runner-proxy
     pass_if H2.proxy-kill-denied $? "kill -9 <proxy pid> -> rc=$rc '${out: -80}'"
-    out=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://api.github.com/zen 2>&1)
+    out=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
     [ "$out" = 200 ]; pass_if H2.proxy-still-up $? "api.github.com -> $out"
   else
     out=$(sudo -n true 2>&1); rc=$?
@@ -275,7 +282,7 @@ strict() {
   baseline
   out=$(docker ps 2>&1); [ $? -ne 0 ]
   pass_if P.docker-disabled $? "docker ps -> ${out: -100}"
-  out=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/zen 2>&1)
+  out=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
   [ "$out" = 200 ]; pass_if A.curl $? "api.github.com -> $out"
   local OBJ_IP; OBJ_IP=$(ip4 objects.githubusercontent.com)
   expect_blocked C3.resolve-cotenant "curl --resolve octocat.github.io:443:$OBJ_IP" \

@@ -28,7 +28,9 @@ env:
     registry.npmjs.org pypi.org files.pythonhosted.org
     docker.io docker.com
     nip.io sslip.io
-  PASSTHROUGH: 100-64-0-1.sslip.io
+  PASSTHROUGH: 100-64-0-1.sslip.io pt-hosts.sslip.io
+  # authenticated api.github.com calls (the unauthenticated per-IP limit returns 403 on shared runner IPs)
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   enforce:

@@ -13,6 +13,10 @@ pass_if() { # pass_if <id> <condition-exit-code> <detail>
   if [ "$2" -eq 0 ]; then record "$1" PASS "$3"; else record "$1" FAIL "$3"; fi
 }
 
+# api.github.com/zen, authenticated: unauthenticated calls hit GitHub's per-IP rate limit (403)
+# on shared runner egress IPs. curl args (e.g. -o/-w) are passed through.
+gh_zen() { curl -sS -m 20 -H "Authorization: Bearer ${GH_TOKEN:-}" "$@" https://api.github.com/zen; }
+
 ip4() { getent ahostsv4 "$1" | awk '{print $1; exit}'; }
 mark() { wc -c < "$FLOWLOG"; }
 flows_since() { tail -c +"$(( $1 + 1 ))" "$FLOWLOG"; }
