@@ -49,6 +49,11 @@ J
   pass_if A.java $? "java ($JAVA_HOME): $(tail -1 <<<"$out")"
 
   out=$(timeout 120 docker pull -q alpine:3.20 2>&1); record A.docker-pull INFO "rc=$? $(tail -1 <<<"$out")"
+
+  # ~300 MiB of a GitHub release asset through the MITM (single stream, informational)
+  out=$(curl -sS -L -m 120 -r 0-314572799 -o /dev/null -w '%{size_download} %{time_total}' \
+    'https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz' 2>&1)
+  record D.throughput-mitm INFO "$(awk '{ if ($2>0) printf "%.0f MiB in %.1fs = %.0f MiB/s", $1/1048576, $2, $1/1048576/$2; else print }' <<<"$out")"
 }
 
 must_fail() {
@@ -114,6 +119,16 @@ must_fail() {
   record DNS.allowed-via-azure INFO "dig @168.63.129.16 api.github.com -> $(tr '\n' ' ' <<<"$out")"
   grep -q 'query\[A\] example.org' /var/log/safer-runner/dns.log
   pass_if DNS.redirected-to-dnsmasq $? "dnsmasq logged the direct-IP queries for example.org"
+
+  # Proxy crash: systemd restarts it (same CA from tmpfs) and traffic recovers (GA gate preview)
+  local t0 code
+  sudo systemctl kill -s KILL safer-runner-proxy
+  t0=$(date +%s.%N)
+  for _ in $(seq 1 30); do
+    code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' https://api.github.com/zen 2>/dev/null) && [ "$code" = 200 ] && break
+    sleep 0.5
+  done
+  record X.proxy-kill-recovery INFO "SIGKILL -> api.github.com $code after $(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')s; restarts=$(systemctl show -p NRestarts --value safer-runner-proxy)"
 
   rec=$(jq -c 'select(.ev=="tls" and .layer=="sni" and .verdict=="BLOCK")' "$FLOWLOG" | wc -l)
   [ "$rec" -gt 0 ]; pass_if S.sni-layer-block-fired $? "$rec SNI-layer BLOCK records (enforcement happened at the ClientHello, not only Host)"

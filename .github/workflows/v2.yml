@@ -24,7 +24,7 @@ defaults:
 env:
   ALLOWED: >-
     registry.npmjs.org pypi.org files.pythonhosted.org
-    registry-1.docker.io auth.docker.io production.cloudflare.docker.com
+    docker.io docker.com
 
 jobs:
   enforce:
