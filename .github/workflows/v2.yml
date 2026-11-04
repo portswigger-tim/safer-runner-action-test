@@ -38,7 +38,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (enforce)
-        uses: portswigger-tim/safer-runner-action@v2
+        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.1
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -113,7 +113,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (analyze)
-        uses: portswigger-tim/safer-runner-action@v2
+        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.1
         with:
           mode: analyze
       - uses: actions/checkout@v7
@@ -156,7 +156,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (enforce, strict privilege layer)
-        uses: portswigger-tim/safer-runner-action@v2
+        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.1
         with:
           mode: enforce
           disable-sudo: true
