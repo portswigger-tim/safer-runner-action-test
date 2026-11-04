@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run only this job (enforce|analyze|strict), or all'
+        description: 'Run only this job (enforce|advisory|analyze|strict), or all'
         required: false
         default: 'all'
 
@@ -22,9 +22,13 @@ defaults:
     shell: bash
 
 env:
+  # nip.io / sslip.io: public wildcard DNS (169.254.169.254.nip.io -> 169.254.169.254), used to
+  # prove allowlisted names that resolve to internal addresses are refused (review H1)
   ALLOWED: >-
     registry.npmjs.org pypi.org files.pythonhosted.org
     docker.io docker.com
+    nip.io sslip.io
+  PASSTHROUGH: 100-64-0-1.sslip.io
 
 jobs:
   enforce:
@@ -37,11 +41,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
-      - name: safer-runner v2 (enforce)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.1
+      # Default enforce: since beta.2 this removes sudo (disable-sudo unset = on in enforce, H2)
+      - name: safer-runner v2 (enforce, defaults)
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
 
       - name: checkout (through the proxy - agent survival)
         uses: actions/checkout@v7
@@ -51,6 +57,12 @@ jobs:
 
       - name: must-fail (the point of v2)
         run: v2test/checks.sh must-fail || true
+
+      - name: SSRF - allowlisted names resolving to internal addresses (H1)
+        run: v2test/checks.sh ssrf || true
+
+      - name: default enforce removed sudo (H2)
+        run: v2test/checks.sh privilege-removed || true
 
       - name: prepare artifact / cache payload
         run: |
@@ -102,6 +114,48 @@ jobs:
           path: evidence/
           retention-days: 7
 
+  advisory:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'advisory' }}
+    name: enforce+disable-sudo:false (ADVISORY) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
+    steps:
+      # Explicit opt-out: sudo kept, job labelled "enforce (ADVISORY - sudo retained)" (H2)
+      - name: safer-runner v2 (enforce, sudo retained)
+        uses: portswigger-tim/safer-runner-action@v2
+        with:
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
+          disable-sudo: false
+      - uses: actions/checkout@v7
+      - name: advisory label + sudo kept (H2)
+        run: v2test/checks.sh privilege-retained || true
+      - name: must-fail
+        run: v2test/checks.sh must-fail || true
+      - name: SSRF (H1)
+        run: v2test/checks.sh ssrf || true
+      - name: sudo-dependent must-fail (REDIRECT hole, proxy-side IP guard via /etc/hosts, proxy kill)
+        run: v2test/checks.sh sudo-must-fail || true
+      - name: results
+        if: always()
+        run: source v2test/lib.sh && finish "advisory / ${{ matrix.os }}"
+      - name: evidence
+        if: always()
+        run: |
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          sudo journalctl -u safer-runner-proxy --no-pager > evidence/proxy-journal.txt 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-advisory-${{ matrix.os }}
+          path: evidence/
+          retention-days: 7
+
   analyze:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'analyze' }}
     name: analyze / ${{ matrix.os }}
@@ -113,7 +167,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (analyze)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.1
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: analyze
       - uses: actions/checkout@v7
@@ -156,7 +210,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (enforce, strict privilege layer)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.1
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: enforce
           disable-sudo: true

@@ -58,3 +58,21 @@ finish() {
   } >> "$GITHUB_STEP_SUMMARY"
   if grep -q $'\tFAIL\t' "$RESULTS"; then echo "::error::$(grep -c $'\tFAIL\t' "$RESULTS") check(s) failed"; exit 1; fi
 }
+
+# expect_upstream_refused <id> <desc> <forbidden-ip-or-empty> <jq-select> <cmd...>
+# PASS iff the request did not succeed (curl error or non-2xx/3xx), the proxy logged a matching
+# record (the upstream IP guard), and it never opened a server connection to <forbidden-ip>.
+expect_upstream_refused() {
+  local id=$1 desc=$2 ip=$3 sel=$4; shift 4
+  local m out rc rec hit=""; m=$(mark)
+  out=$("$@" 2>&1); rc=$?
+  sleep 0.5
+  rec=$(flows_q "$m" "$sel" | head -1)
+  [ -n "$ip" ] && hit=$(flows_q "$m" ".ev==\"server-connect\" and (.peername // \"\" | startswith(\"$ip:\"))" | head -1)
+  if { [ $rc -ne 0 ] || ! [[ "${out: -3}" =~ ^[23][0-9][0-9]$ ]]; } && [ -n "$rec" ] && [ -z "$hit" ]; then
+    record "$id" PASS "$desc -> refused (rc=$rc out='${out: -80}'); $rec"
+  else
+    record "$id" FAIL "$desc -> rc=$rc out='${out: -120}'; guard record: ${rec:-<none>}; reached: ${hit:-no}"
+  fi
+}
+

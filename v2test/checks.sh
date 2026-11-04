@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# safer-runner v2 real-runner checks. usage: checks.sh <must-pass|must-fail|analyze|strict>
+# safer-runner v2 real-runner checks.
+# usage: checks.sh <must-pass|must-fail|sudo-must-fail|ssrf|analyze|strict|privilege-removed|privilege-retained|baseline>
 set -u
 cd "$(dirname "$0")/.."
 source v2test/lib.sh
@@ -96,15 +97,6 @@ must_fail() {
   out=$(curl -sS -m 15 -o /dev/null https://example.org/ 2>&1); rc=$?
   [ $rc -ne 0 ]; pass_if D.dns-refused-https $? "https://example.org (not allowlisted) -> rc=$rc '${out: -80}'"
 
-  # A hole punched in the REDIRECT must still be stopped by the filter REJECT (fail closed).
-  m=$(mark)
-  sudo iptables -t nat -I SAFER_RUNNER_NAT 1 -d "$ATTACKER_IP/32" -j RETURN
-  out=$(curl -k -sS -m 8 -o /dev/null -w '%{http_code}' "https://$ATTACKER_IP/" 2>&1); rc=$?
-  sudo iptables -t nat -D SAFER_RUNNER_NAT 1
-  sleep 0.5; rec=$(flows_q "$m" "(.dst // \"\" | startswith(\"$ATTACKER_IP:\"))" | head -1)
-  [ $rc -ne 0 ] && [ -z "$rec" ]
-  pass_if B.fail-closed-hole $? "REDIRECT bypassed for $ATTACKER_IP (proxy never saw it) -> rc=$rc '${out: -80}'"
-
   out=$(timeout 8 bash -c "echo > /dev/tcp/$ATTACKER_IP/853" 2>&1); rc=$?
   [ $rc -ne 0 ]; pass_if B.non-http-port $? "tcp $ATTACKER_IP:853 (DoT) -> rc=$rc ${out: -60}"
   out=$(curl -6 -sS -m 8 -o /dev/null 'https://[2606:4700:4700::1111]/' 2>&1); rc=$?
@@ -120,8 +112,42 @@ must_fail() {
   grep -q 'query\[A\] example.org' /var/log/safer-runner/dns.log
   pass_if DNS.redirected-to-dnsmasq $? "dnsmasq logged the direct-IP queries for example.org"
 
+  rec=$(jq -c 'select(.ev=="tls" and .layer=="sni" and .verdict=="BLOCK")' "$FLOWLOG" | wc -l)
+  [ "$rec" -gt 0 ]; pass_if S.sni-layer-block-fired $? "$rec SNI-layer BLOCK records (enforcement happened at the ClientHello, not only Host)"
+}
+
+# Needs sudo: only meaningful in the advisory job (enforce + disable-sudo: false).
+sudo_must_fail() {
+  local m out rc rec t0 code
+  # A hole punched in the REDIRECT must still be stopped by the filter REJECT (fail closed).
+  m=$(mark)
+  sudo iptables -t nat -I SAFER_RUNNER_NAT 1 -d "$ATTACKER_IP/32" -j RETURN
+  out=$(curl -k -sS -m 8 -o /dev/null -w '%{http_code}' "https://$ATTACKER_IP/" 2>&1); rc=$?
+  sudo iptables -t nat -D SAFER_RUNNER_NAT 1
+  sleep 0.5; rec=$(flows_q "$m" "(.dst // \"\" | startswith(\"$ATTACKER_IP:\"))" | head -1)
+  [ $rc -ne 0 ] && [ -z "$rec" ]
+  pass_if B.fail-closed-hole $? "REDIRECT bypassed for $ATTACKER_IP (proxy never saw it) -> rc=$rc '${out: -80}'"
+
+  # H1, addon layer alone: /etc/hosts makes the PROXY resolve allowlisted names to internal
+  # addresses without dnsmasq (whose stop-dns-rebind would otherwise refuse them first). The
+  # client dials a public IP, so the only thing that can refuse is the proxy's IP guard.
+  printf '169.254.169.254 imds-hosts.nip.io\n127.0.0.1 lo-hosts.nip.io\n10.0.0.1 rfc1918-hosts.nip.io\nfd00::1 ula-hosts.nip.io\n' | sudo tee -a /etc/hosts >/dev/null
+  local n ip
+  for pair in imds-hosts:169.254.169.254 lo-hosts:127.0.0.1 rfc1918-hosts:10.0.0.1; do
+    n="${pair%%:*}.nip.io"; ip="${pair#*:}"
+    expect_upstream_refused "H1.guard-http-$ip" "proxy resolves $n -> $ip (/etc/hosts); plain HTTP dialled at $ATTACKER_IP" "$ip" \
+      ".ev==\"upstream\" and .host==\"$n\" and .verdict==\"BLOCK\" and .reason==\"upstream-ip-forbidden\"" \
+      curl -sS -m 10 -o /dev/null -w '%{http_code}' -H 'Metadata: true' --resolve "$n:80:$ATTACKER_IP" "http://$n/metadata/instance?api-version=2021-02-01"
+    expect_upstream_refused "H1.guard-https-$ip" "proxy resolves $n -> $ip (/etc/hosts); HTTPS (intercept) dialled at $ATTACKER_IP" "$ip" \
+      ".ev==\"upstream\" and .host==\"$n\" and .verdict==\"BLOCK\"" \
+      curl -k -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "$n:443:$ATTACKER_IP" "https://$n/"
+  done
+  expect_upstream_refused "H1.guard-ula" "proxy resolves ula-hosts.nip.io -> fd00::1 (/etc/hosts)" "" \
+    '.ev=="upstream" and .host=="ula-hosts.nip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden"' \
+    curl -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "ula-hosts.nip.io:80:$ATTACKER_IP" http://ula-hosts.nip.io/
+  sudo sed -i '/-hosts\.nip\.io$/d' /etc/hosts
+
   # Proxy crash: systemd restarts it (same CA from tmpfs) and traffic recovers (GA gate preview)
-  local t0 code
   sudo systemctl kill -s KILL safer-runner-proxy
   t0=$(date +%s.%N)
   for _ in $(seq 1 30); do
@@ -129,9 +155,94 @@ must_fail() {
     sleep 0.5
   done
   record X.proxy-kill-recovery INFO "SIGKILL -> api.github.com $code after $(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')s; restarts=$(systemctl show -p NRestarts --value safer-runner-proxy)"
+}
 
-  rec=$(jq -c 'select(.ev=="tls" and .layer=="sni" and .verdict=="BLOCK")' "$FLOWLOG" | wc -l)
-  [ "$rec" -gt 0 ]; pass_if S.sni-layer-block-fired $? "$rec SNI-layer BLOCK records (enforcement happened at the ClientHello, not only Host)"
+# H1: allowlisted names (nip.io / sslip.io are allowlisted in these jobs) that resolve to
+# internal addresses must never be reached through the proxy.
+ssrf() {
+  local out n
+  # dnsmasq layer: stop-dns-rebind drops private answers; public answers under the same suffix still resolve
+  for n in 169.254.169.254.nip.io 127.0.0.1.nip.io 10.0.0.1.nip.io 192.168.1.1.nip.io; do
+    out=$(dig +short +time=3 +tries=2 @127.0.0.1 "$n" A 2>&1)
+    if grep -qE '^[0-9]+\.' <<<"$out"; then record "H1.dns-rebind-$n" FAIL "dig $n -> $out"; else
+      record "H1.dns-rebind-$n" PASS "dig $n -> '${out:-<no answer>}' (rebind answer dropped)"; fi
+  done
+  grep -q 'DNS-rebind' /var/log/safer-runner/dns.log
+  pass_if H1.dns-rebind-logged $? "dnsmasq logged: $(grep -m1 'DNS-rebind' /var/log/safer-runner/dns.log | cut -c1-160)"
+  out=$(dig +short +time=3 +tries=2 @127.0.0.1 1.1.1.1.nip.io A 2>&1)
+  [ "$out" = 1.1.1.1 ]; pass_if H1.dns-public-still-resolves $? "dig 1.1.1.1.nip.io -> $out"
+
+  # end to end: IMDS by an allowlisted name (no --resolve) must not answer
+  out=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H 'Metadata: true' 'http://169.254.169.254.nip.io/metadata/instance?api-version=2021-02-01' 2>&1); local rc=$?
+  { [ $rc -ne 0 ] || [ "${out: -3}" != 200 ]; }
+  pass_if H1.imds-by-name $? "http://169.254.169.254.nip.io/metadata/instance -> rc=$rc '${out: -80}'"
+
+  # through the proxy, dnsmasq refuses: the proxy's lookup fails -> upstream-unresolved
+  expect_upstream_refused H1.proxy-imds-http "Host 169.254.169.254.nip.io dialled at $ATTACKER_IP (plain HTTP)" 169.254.169.254 \
+    '.ev=="upstream" and .host=="169.254.169.254.nip.io" and .verdict=="BLOCK"' \
+    curl -sS -m 10 -o /dev/null -w '%{http_code}' -H 'Metadata: true' --resolve "169.254.169.254.nip.io:80:$ATTACKER_IP" 'http://169.254.169.254.nip.io/metadata/instance?api-version=2021-02-01'
+  expect_upstream_refused H1.proxy-loopback-https "SNI 127.0.0.1.nip.io dialled at $ATTACKER_IP (intercept)" 127.0.0.1 \
+    '.ev=="upstream" and .host=="127.0.0.1.nip.io" and .verdict=="BLOCK"' \
+    curl -k -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "127.0.0.1.nip.io:443:$ATTACKER_IP" https://127.0.0.1.nip.io/
+  expect_upstream_refused H1.proxy-rfc1918-http "Host 10.0.0.1.nip.io dialled at $ATTACKER_IP" 10.0.0.1 \
+    '.ev=="upstream" and .host=="10.0.0.1.nip.io" and .verdict=="BLOCK"' \
+    curl -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "10.0.0.1.nip.io:80:$ATTACKER_IP" http://10.0.0.1.nip.io/
+
+  # addon layer: CGNAT is NOT covered by stop-dns-rebind, so only the proxy's IP guard stops it
+  expect_upstream_refused H1.guard-cgnat-http "http://100.64.0.1.nip.io/ (resolves to CGNAT)" 100.64.0.1 \
+    '.ev=="upstream" and .host=="100.64.0.1.nip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden"' \
+    curl -sS -m 10 -o /dev/null -w '%{http_code}' http://100.64.0.1.nip.io/
+  expect_upstream_refused H1.guard-cgnat-https "https://100.64.0.1.nip.io/ (intercept)" 100.64.0.1 \
+    '.ev=="upstream" and .host=="100.64.0.1.nip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden"' \
+    curl -k -sS -m 10 -o /dev/null -w '%{http_code}' https://100.64.0.1.nip.io/
+  # passthrough connections get the same guard (100-64-0-1.sslip.io is a passthrough-domain here)
+  expect_upstream_refused H1.guard-cgnat-passthrough "https://100-64-0-1.sslip.io/ (passthrough, SNI only)" 100.64.0.1 \
+    '.ev=="upstream" and .host=="100-64-0-1.sslip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden"' \
+    curl -k -sS -m 10 -o /dev/null -w '%{http_code}' https://100-64-0-1.sslip.io/
+
+  # legitimate: a public answer under the same allowlisted suffix is connected to (and pinned)
+  local m rec; m=$(mark)
+  out=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' http://1.1.1.1.nip.io/ 2>&1)
+  sleep 0.5; rec=$(flows_q "$m" '.ev=="server-connect" and (.peername // "" | startswith("1.1.1.1:")) and (.address // "" | startswith("1.1.1.1.nip.io:"))' | head -1)
+  [ -n "$rec" ]; pass_if H1.public-name-connects $? "http://1.1.1.1.nip.io/ -> $out; $rec"
+}
+
+# H2: the privilege state the job ended up with
+privilege() { # privilege <expect-sudo: yes|no>
+  local out rc retained
+  retained=$(jq -r '.sudoRetained' /etc/safer-runner/setup-complete 2>&1)
+  if [ "$1" = no ]; then
+    out=$(sudo -n true 2>&1); rc=$?
+    [ $rc -ne 0 ]; pass_if H2.sudo-removed $? "sudo -n true -> rc=$rc ${out: -100}"
+    [ "$retained" = false ]; pass_if H2.marker-not-advisory $? "setup-complete sudoRetained=$retained"
+    # the runner user can't stop the proxy unit (polkit) or signal it (other uid)
+    out=$(systemctl stop safer-runner-proxy 2>&1 </dev/null); rc=$?
+    [ $rc -ne 0 ] && systemctl is-active -q safer-runner-proxy
+    pass_if H2.unit-stop-denied $? "systemctl stop (no sudo) -> rc=$rc '${out: -80}'; unit $(systemctl is-active safer-runner-proxy)"
+    out=$(kill -9 "$(systemctl show -p MainPID --value safer-runner-proxy)" 2>&1); rc=$?
+    [ $rc -ne 0 ] && systemctl is-active -q safer-runner-proxy
+    pass_if H2.proxy-kill-denied $? "kill -9 <proxy pid> -> rc=$rc '${out: -80}'"
+    out=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://api.github.com/zen 2>&1)
+    [ "$out" = 200 ]; pass_if H2.proxy-still-up $? "api.github.com -> $out"
+  else
+    out=$(sudo -n true 2>&1); rc=$?
+    [ $rc -eq 0 ]; pass_if H2.sudo-retained $? "sudo -n true -> rc=$rc (explicit disable-sudo: false)"
+    [ "$retained" = true ]; pass_if H2.marker-advisory $? "setup-complete sudoRetained=$retained (summary header says ADVISORY)"
+  fi
+}
+
+# M1: the integrity baseline is root-owned and out of the runner's reach
+baseline() {
+  local f=/etc/safer-runner/validation-state.json out rc
+  out=$(stat -c '%U:%G %a' "$f" 2>&1)  # stat needs only search permission on the (0755) directory
+  [ "$out" = "root:root 600" ]; pass_if M1.baseline-root-0600 $? "$f -> $out"
+  [ ! -e /tmp/safer-runner-validation-state.json ]; pass_if M1.no-tmp-baseline $? "/tmp/safer-runner-validation-state.json absent"
+  out=$( (echo '{}' > "$f") 2>&1); rc=$?
+  [ $rc -ne 0 ]; pass_if M1.runner-cannot-write $? "runner write -> rc=$rc ${out: -80}"
+  out=$(cat "$f" 2>&1); rc=$?
+  [ $rc -ne 0 ]; pass_if M1.runner-cannot-read $? "runner cat -> rc=$rc ${out: -80}"
+  out=$(sudo -n cat "$f" 2>&1 | jq -r '.files | length' 2>&1)
+  [[ "$out" =~ ^[1-9][0-9]*$ ]]; pass_if M1.validation-read-allowed $? "sudo -n cat (exact allowlist entry) -> $out files in baseline"
 }
 
 analyze() {
@@ -148,12 +259,20 @@ analyze() {
   out=$(dig +short +time=3 +tries=1 @8.8.8.8 example.org A 2>&1)
   grep -q 'query\[A\] example.org' /var/log/safer-runner/dns.log
   pass_if Z.dns-redirected $? "dig @8.8.8.8 answered via dnsmasq: $(tr '\n' ' ' <<<"$out")"
+  # H1 in analyze: the upstream IP guard logs WOULD_BLOCK (monitoring only), it does not refuse
+  m=$(mark)
+  out=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' http://100.64.0.1.nip.io/ 2>&1)
+  sleep 0.5; rec=$(flows_q "$m" '.ev=="upstream" and .host=="100.64.0.1.nip.io" and .verdict=="WOULD_BLOCK" and .reason=="upstream-ip-forbidden"' | head -1)
+  [ -n "$rec" ]; pass_if Z.upstream-guard-logged $? "http://100.64.0.1.nip.io/ -> '${out: -40}', logged: $rec"
+  out=$(sudo -n true 2>&1); [ $? -eq 0 ]; pass_if Z.analyze-keeps-sudo $? "sudo -n true in analyze (default disable-sudo off)"
 }
 
 strict() {
   local out
   out=$(sudo -n true 2>&1); [ $? -ne 0 ]
   pass_if P.sudo-disabled $? "sudo -n true -> ${out: -100}"
+  privilege no
+  baseline
   out=$(docker ps 2>&1); [ $? -ne 0 ]
   pass_if P.docker-disabled $? "docker ps -> ${out: -100}"
   out=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/zen 2>&1)
@@ -163,6 +282,9 @@ strict() {
     '.ev=="tls" and .sni=="octocat.github.io" and .verdict=="BLOCK"' \
     curl -sS -m 15 -o /dev/null -w '%{http_code}' --resolve "octocat.github.io:443:$OBJ_IP" https://octocat.github.io/
 }
+
+privilege_removed() { privilege no; }
+privilege_retained() { privilege yes; }
 
 trap 'record "harness.$1" FAIL "checks.sh $1 aborted (line $LINENO)"' EXIT
 "${1//-/_}"
