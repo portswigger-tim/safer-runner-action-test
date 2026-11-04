@@ -48,7 +48,7 @@ J
   out=$(timeout 120 java /tmp/j/Main.java 2>&1)
   pass_if A.java $? "java ($JAVA_HOME): $(tail -1 <<<"$out")"
 
-  out=$(timeout 120 docker pull -q alpine:3.20 2>&1); record A.docker-pull INFO "rc=$? $(tail -1 <<<"$out")"
+  out=$(timeout 120 docker pull -q alpine:3.20 2>&1); record A.docker-pull INFO "rc=$? $(tail -1 <<<"$out" | cut -c1-160)"
 
   # ~300 MiB of a GitHub release asset through the MITM (single stream, informational)
   out=$(curl -sS -L -m 120 -r 0-314572799 -o /dev/null -w '%{size_download} %{time_total}' \
