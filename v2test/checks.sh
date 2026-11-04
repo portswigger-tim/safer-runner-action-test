@@ -89,7 +89,7 @@ must_fail() {
     curl -sS -m 15 -o /dev/null -w '%{http_code}' --resolve "example.org:80:$ATTACKER_IP" http://example.org/
 
   out=$(curl -sS -m 15 -o /dev/null https://example.org/ 2>&1); rc=$?
-  [ $rc -ne 0 ]; pass_if D.dns-refused-https "https://example.org (not allowlisted) -> rc=$rc '${out: -80}'"
+  [ $rc -ne 0 ]; pass_if D.dns-refused-https $? "https://example.org (not allowlisted) -> rc=$rc '${out: -80}'"
 
   # A hole punched in the REDIRECT must still be stopped by the filter REJECT (fail closed).
   m=$(mark)
@@ -98,12 +98,12 @@ must_fail() {
   sudo iptables -t nat -D SAFER_RUNNER_NAT 1
   sleep 0.5; rec=$(flows_q "$m" "(.dst // \"\" | startswith(\"$ATTACKER_IP:\"))" | head -1)
   [ $rc -ne 0 ] && [ -z "$rec" ]
-  pass_if B.fail-closed-hole "REDIRECT bypassed for $ATTACKER_IP (proxy never saw it) -> rc=$rc '${out: -80}'"
+  pass_if B.fail-closed-hole $? "REDIRECT bypassed for $ATTACKER_IP (proxy never saw it) -> rc=$rc '${out: -80}'"
 
   out=$(timeout 8 bash -c "echo > /dev/tcp/$ATTACKER_IP/853" 2>&1); rc=$?
-  [ $rc -ne 0 ]; pass_if B.non-http-port "tcp $ATTACKER_IP:853 (DoT) -> rc=$rc ${out: -60}"
+  [ $rc -ne 0 ]; pass_if B.non-http-port $? "tcp $ATTACKER_IP:853 (DoT) -> rc=$rc ${out: -60}"
   out=$(curl -6 -sS -m 8 -o /dev/null 'https://[2606:4700:4700::1111]/' 2>&1); rc=$?
-  [ $rc -ne 0 ]; pass_if B.ipv6 "IPv6 literal -> rc=$rc ${out: -60}"
+  [ $rc -ne 0 ]; pass_if B.ipv6 $? "IPv6 literal -> rc=$rc ${out: -60}"
 
   for r in 168.63.129.16 8.8.8.8 127.0.0.53; do
     out=$(dig +short +time=3 +tries=1 "@$r" example.org A 2>&1)
@@ -116,7 +116,7 @@ must_fail() {
   pass_if DNS.redirected-to-dnsmasq $? "dnsmasq logged the direct-IP queries for example.org"
 
   rec=$(jq -c 'select(.ev=="tls" and .layer=="sni" and .verdict=="BLOCK")' "$FLOWLOG" | wc -l)
-  [ "$rec" -gt 0 ]; pass_if S.sni-layer-block-fired "$rec SNI-layer BLOCK records (enforcement happened at the ClientHello, not only Host)"
+  [ "$rec" -gt 0 ]; pass_if S.sni-layer-block-fired $? "$rec SNI-layer BLOCK records (enforcement happened at the ClientHello, not only Host)"
 }
 
 analyze() {
@@ -125,28 +125,30 @@ analyze() {
   out=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' https://example.org/ 2>&1)
   sleep 0.5; rec=$(flows_q "$m" '.ev=="tls" and .sni=="example.org" and .verdict=="WOULD_BLOCK" and .passthrough==true' | head -1)
   [ "$out" = 200 ] && [ -n "$rec" ]
-  pass_if Z.not-allowlisted-works "https://example.org -> $out (passed through by SNI, logged WOULD_BLOCK): $rec"
+  pass_if Z.not-allowlisted-works $? "https://example.org -> $out (passed through by SNI, logged WOULD_BLOCK): $rec"
   m=$(mark)
   out=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H 'Host: api.github.com' https://github.com/ 2>&1)
   sleep 0.5; rec=$(flows_q "$m" '.ev=="https" and .reason=="host-sni-mismatch" and .verdict=="WOULD_BLOCK"' | head -1)
-  [ -n "$rec" ]; pass_if Z.fronting-logged "fronting in analyze -> $out, logged: $rec"
+  [ -n "$rec" ]; pass_if Z.fronting-logged $? "fronting in analyze -> $out, logged: $rec"
   out=$(dig +short +time=3 +tries=1 @8.8.8.8 example.org A 2>&1)
   grep -q 'query\[A\] example.org' /var/log/safer-runner/dns.log
-  pass_if Z.dns-redirected "dig @8.8.8.8 answered via dnsmasq: $(tr '\n' ' ' <<<"$out")"
+  pass_if Z.dns-redirected $? "dig @8.8.8.8 answered via dnsmasq: $(tr '\n' ' ' <<<"$out")"
 }
 
 strict() {
   local out
   out=$(sudo -n true 2>&1); [ $? -ne 0 ]
-  pass_if P.sudo-disabled "sudo -n true -> ${out: -100}"
+  pass_if P.sudo-disabled $? "sudo -n true -> ${out: -100}"
   out=$(docker ps 2>&1); [ $? -ne 0 ]
-  pass_if P.docker-disabled "docker ps -> ${out: -100}"
+  pass_if P.docker-disabled $? "docker ps -> ${out: -100}"
   out=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/zen 2>&1)
-  [ "$out" = 200 ]; pass_if A.curl "api.github.com -> $out"
+  [ "$out" = 200 ]; pass_if A.curl $? "api.github.com -> $out"
   local OBJ_IP; OBJ_IP=$(ip4 objects.githubusercontent.com)
   expect_blocked C3.resolve-cotenant "curl --resolve octocat.github.io:443:$OBJ_IP" \
     '.ev=="tls" and .sni=="octocat.github.io" and .verdict=="BLOCK"' \
     curl -sS -m 15 -o /dev/null -w '%{http_code}' --resolve "octocat.github.io:443:$OBJ_IP" https://octocat.github.io/
 }
 
+trap 'record "harness.$1" FAIL "checks.sh $1 aborted (line $LINENO)"' EXIT
 "${1//-/_}"
+trap - EXIT
