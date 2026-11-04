@@ -968,3 +968,27 @@ jobs:
             echo "direct-IP HTTPS to 1.1.1.1 blocked as expected"
           fi
           exit $fail
+
+  test-custom-dns-enforce:
+    name: custom DNS server works in enforce mode (${{ inputs.os }})
+    runs-on: ${{ inputs.os }}
+    steps:
+      - name: Apply Safer Runner Action (enforce; custom primary DNS, empty secondary)
+        uses: portswigger-tim/safer-runner-action@main
+        with:
+          mode: 'enforce'
+          allowed-domains: 'example.com'
+          primary-dns-server: '1.1.1.1'
+          secondary-dns-server: ''
+      - name: Allowed domain resolves via the custom upstream (M1 regression guard)
+        run: |
+          echo "iptables OUTPUT DNS allows (should target 1.1.1.1, not Quad9):"
+          sudo iptables -S OUTPUT | grep -E 'dport 53' || true
+          ans=$(dig +short +time=5 +tries=2 @127.0.0.1 example.com A || true)
+          echo "example.com A -> ${ans:-<empty>}"
+          if [ -z "$ans" ]; then
+            echo "::error::enforce+custom DNS failed to resolve an allowed domain (M1 regressed)"; exit 1
+          fi
+          if sudo iptables -S OUTPUT | grep -qE '9\.9\.9\.9.*dport 53'; then
+            echo "::warning::firewall still allows Quad9 DNS despite a custom primary"
+          fi
