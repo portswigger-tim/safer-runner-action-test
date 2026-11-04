@@ -1,0 +1,171 @@
+name: v2 (L7 proxy) real-runner suite
+
+# safer-runner-action v2 (branch v2): must-pass, must-fail and survival checks on
+# GitHub-hosted runners. Results land in each job's step summary; any FAIL fails the job.
+on:
+  push:
+    branches:
+      - v2-test
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'safer-runner-action ref (informational; the jobs use @v2)'
+        required: false
+        default: 'v2'
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ALLOWED: >-
+    registry.npmjs.org pypi.org files.pythonhosted.org
+    registry-1.docker.io auth.docker.io production.cloudflare.docker.com
+
+jobs:
+  enforce:
+    name: enforce / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - name: safer-runner v2 (enforce)
+        uses: portswigger-tim/safer-runner-action@v2
+        with:
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+
+      - name: checkout (through the proxy - agent survival)
+        uses: actions/checkout@v7
+
+      - name: must-pass
+        run: v2test/checks.sh must-pass || true
+
+      - name: must-fail (the point of v2)
+        run: v2test/checks.sh must-fail || true
+
+      - name: prepare artifact / cache payload
+        run: |
+          mkdir -p art cache-dir
+          head -c 20000000 /dev/urandom > art/payload.bin
+          sha256sum art/payload.bin | cut -d' ' -f1 > art.sha256
+          cp art/payload.bin cache-dir/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: v2-enforce-${{ matrix.os }}
+          path: art/payload.bin
+          retention-days: 1
+      - uses: actions/download-artifact@v8
+        with:
+          name: v2-enforce-${{ matrix.os }}
+          path: dl
+      - uses: actions/cache/save@v6
+        with:
+          path: cache-dir
+          key: v2-${{ github.run_id }}-${{ github.run_attempt }}-enforce-${{ matrix.os }}
+      - name: wait for cache consistency (GitHub lag, seen without a proxy too)
+        run: sleep 10
+      - uses: actions/cache/restore@v6
+        id: restore
+        with:
+          path: cache-dir
+          key: v2-${{ github.run_id }}-${{ github.run_attempt }}-enforce-${{ matrix.os }}
+          fail-on-cache-miss: true
+
+      - name: results
+        if: always()
+        run: |
+          source v2test/lib.sh
+          [ "$(sha256sum dl/payload.bin | cut -d' ' -f1)" = "$(cat art.sha256)" ]
+          pass_if R.artifact-roundtrip $? "20MB upload-artifact -> download-artifact sha256"
+          [ "${{ steps.restore.outcome }}" = success ]; pass_if R.cache-roundtrip $? "cache save -> restore: ${{ steps.restore.outcome }}"
+          finish "enforce / ${{ matrix.os }}"
+
+      - name: evidence
+        if: always()
+        run: |
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          sudo journalctl -u safer-runner-proxy --no-pager > evidence/proxy-journal.txt 2>&1 || true
+          sudo iptables-save > evidence/iptables-save.txt 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-enforce-${{ matrix.os }}
+          path: evidence/
+          retention-days: 7
+
+  analyze:
+    name: analyze / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - name: safer-runner v2 (analyze)
+        uses: portswigger-tim/safer-runner-action@v2
+        with:
+          mode: analyze
+      - uses: actions/checkout@v7
+      - name: must-pass
+        run: v2test/checks.sh must-pass || true
+      - name: analyze behaviour
+        run: v2test/checks.sh analyze || true
+      - name: artifact payload
+        run: mkdir -p art && head -c 5000000 /dev/urandom > art/payload.bin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: v2-analyze-${{ matrix.os }}
+          path: art/payload.bin
+          retention-days: 1
+      - name: results
+        if: always()
+        run: source v2test/lib.sh && finish "analyze / ${{ matrix.os }}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-analyze-${{ matrix.os }}
+          path: /var/log/safer-runner/proxy-flows.jsonl
+          retention-days: 7
+
+  strict:
+    name: enforce+disable-sudo+disable-docker / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - name: safer-runner v2 (enforce, strict privilege layer)
+        uses: portswigger-tim/safer-runner-action@v2
+        with:
+          mode: enforce
+          disable-sudo: true
+          disable-docker: true
+          fail-on-tampering: true
+      - uses: actions/checkout@v7
+      - name: strict checks
+        run: v2test/checks.sh strict || true
+      - name: artifact payload
+        run: mkdir -p art && head -c 5000000 /dev/urandom > art/payload.bin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: v2-strict-${{ matrix.os }}
+          path: art/payload.bin
+          retention-days: 1
+      - uses: actions/cache/save@v6
+        with:
+          path: art
+          key: v2-${{ github.run_id }}-${{ github.run_attempt }}-strict-${{ matrix.os }}
+      - name: results
+        if: always()
+        run: source v2test/lib.sh && finish "strict / ${{ matrix.os }}"
