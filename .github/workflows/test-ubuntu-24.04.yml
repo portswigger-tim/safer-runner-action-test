@@ -1,0 +1,20 @@
+name: Test (ubuntu-24.04)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Weekly, to catch GitHub runner-image drift before consumers hit it.
+    - cron: '17 6 * * 1'
+
+jobs:
+  suite:
+    name: ubuntu-24.04
+    uses: ./.github/workflows/suite.yml
+    with:
+      os: ubuntu-24.04

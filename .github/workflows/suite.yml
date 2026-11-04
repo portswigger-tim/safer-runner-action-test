@@ -1,18 +1,19 @@
-name: Test Safer Runner Action
+name: Test suite (reusable, per-OS)
 
+# Reusable: every scenario job for ONE OS. test.yml calls this once per OS so
+# the Actions UI groups by OS instead of by test.
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+  workflow_call:
+    inputs:
+      os:
+        description: 'Runner image to run the whole suite on'
+        required: true
+        type: string
 
 jobs:
   test-analyze-mode:
     name: Test Analyze Mode
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.os }}
     steps:
       - name: Debug runner user information
         run: |
@@ -201,7 +202,7 @@ jobs:
 
   test-enforce-mode:
     name: Test Enforce Mode
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.os }}
     steps:
       - name: Apply Safer Runner Action (Enforce Mode)
         uses: portswigger-tim/safer-runner-action@main
@@ -270,7 +271,7 @@ jobs:
 
   test-github-actions-compatibility:
     name: Test GitHub Actions Compatibility
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.os }}
     steps:
       - name: Apply Safer Runner Action (Enforce Mode)
         uses: portswigger-tim/safer-runner-action@main
@@ -327,7 +328,7 @@ jobs:
 
   test-edge-cases:
     name: Test Edge Cases
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.os }}
     services:
       nginx:
         image: nginx:alpine
@@ -340,11 +341,6 @@ jobs:
         with:
           mode: 'enforce'
           allowed-domains: 'api.github.com httpbin.org'
-
-      - name: Harden Runner
-        uses: step-security/harden-runner@f4a75cfd619ee5ce8d5b864b0d183aff3c69b55a # v2.13.1
-        with:
-          egress-policy: audit
 
       - name: Test DNS resolution
         run: |
@@ -437,7 +433,7 @@ jobs:
 
   test-system-integrity:
     name: Test System Integrity Validation
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.os }}
     steps:
       - name: Apply Safer Runner Action (Analyze Mode)
         uses: portswigger-tim/safer-runner-action@main
@@ -535,7 +531,7 @@ jobs:
 
   test-disable-sudo:
     name: Test Disable Sudo Feature
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.os }}
     steps:
       - name: Verify sudo works before action
         run: |
@@ -579,7 +575,7 @@ jobs:
 
   test-sudo-config:
     name: Test Custom Sudo Config
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.os }}
     steps:
       - name: Verify sudo works before action
         run: |
@@ -653,7 +649,7 @@ jobs:
 
   test-disable-docker:
     name: Test Disable Docker Feature
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.os }}
     steps:
       - name: Verify Docker works before action
         run: |
@@ -719,7 +715,7 @@ jobs:
 
   test-stop-docker:
     name: Test Stop Docker Feature
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.os }}
     steps:
       - name: Verify Docker service is running before action
         run: |
@@ -798,7 +794,7 @@ jobs:
 
   test-combined-lockdown:
     name: Test Combined Lockdown (Sudo + Docker Disabled)
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.os }}
     steps:
       - name: Verify both sudo and Docker work before action
         run: |
@@ -880,3 +876,85 @@ jobs:
           echo "✅ Workflow execution: FUNCTIONAL"
           echo ""
           echo "This demonstrates maximum security for workflows that don't need elevated privileges or containers."
+
+  # --- Added for Ubuntu 26.04 / sudo-rs and the GitHub egress DNS resolver ---
+  # These cover ground the original jobs did not: sudo-config allow/deny,
+  # invalid-config rejection, sudo-rs wildcard handling, and dnsmasq coexisting
+  # with a resolver already on :53 (systemd-resolved @127.0.0.53 or GitHub's
+  # egress-dns-resolver @127.0.0.100 - see actions/runner-images#14925).
+
+  test-invalid-sudo-config:
+    name: Invalid sudo-config fails fast (${{ inputs.os }})
+    runs-on: ${{ inputs.os }}
+    steps:
+      - name: Apply with clearly invalid sudoers (must fail)
+        id: apply
+        continue-on-error: true
+        uses: portswigger-tim/safer-runner-action@main
+        with:
+          mode: 'enforce'
+          sudo-config: 'this is not valid sudoers syntax at all'
+      - name: Assert the action rejected it
+        run: |
+          if [ "${{ steps.apply.outcome }}" != "failure" ]; then
+            echo "::error::invalid sudo-config should have failed the action"; exit 1
+          fi
+          echo "invalid sudo-config correctly rejected on ${{ inputs.os }}"
+
+  report-embedded-wildcard-sudo-config:
+    name: Embedded-wildcard sudo-config (informational, ${{ inputs.os }})
+    runs-on: ${{ inputs.os }}
+    steps:
+      - name: Apply with an embedded wildcard in command args
+        id: embedded
+        continue-on-error: true
+        uses: portswigger-tim/safer-runner-action@main
+        with:
+          mode: 'enforce'
+          sudo-config: 'runner ALL=(root) NOPASSWD: /usr/sbin/iptables -L * -n --line-numbers'
+      - name: Report how this runner's sudo handled it
+        run: |
+          echo "${{ inputs.os }}: embedded-wildcard outcome = ${{ steps.embedded.outcome }}"
+          echo "(classic sudo accepts embedded wildcards; sudo-rs rejects them. Informational - never fails.)"
+
+  test-dns-resolution-and-coexistence:
+    name: dnsmasq resolves and coexists on :53 (${{ inputs.os }})
+    runs-on: ${{ inputs.os }}
+    steps:
+      - name: Resolvers before the action
+        run: |
+          . /etc/os-release && echo "OS: $PRETTY_NAME"
+          echo "resolv.conf:"; cat /etc/resolv.conf || true
+          echo ":53 listeners before:"; sudo ss -lntup 'sport = :53' || true
+      - name: Apply Safer Runner Action (enforce)
+        uses: portswigger-tim/safer-runner-action@main
+        with:
+          mode: 'enforce'
+          allowed-domains: 'api.github.com'
+      - name: dnsmasq is on 127.0.0.1 and an allowed domain resolves
+        run: |
+          echo ":53 listeners after (dnsmasq should be on 127.0.0.1; another resolver may hold 127.0.0.53/127.0.0.100):"
+          sudo ss -lntup 'sport = :53' || true
+          ans=$(dig +short +time=5 +tries=2 @127.0.0.1 api.github.com A || true)
+          echo "api.github.com A -> ${ans:-<empty>}"
+          if [ -z "$ans" ]; then
+            echo "::error::dnsmasq up but did not resolve an allowed domain (upstream/egress issue?)"; exit 1
+          fi
+      - name: Direct-IP egress is blocked in enforce mode (clean, no harden-runner)
+        run: |
+          # Enforce mode must block DNS/HTTP straight to an arbitrary external IP,
+          # independent of dnsmasq. This is a pure safer-runner check.
+          echo "default route: $(ip route show default || true)"
+          echo "iptables OUTPUT:"; sudo iptables -S OUTPUT || true
+          fail=0
+          if timeout 3 dig +time=2 +tries=1 @8.8.8.8 google.com +short | grep -qE '^[0-9]+\.'; then
+            echo "::error::direct-IP DNS to 8.8.8.8 was NOT blocked in enforce mode"; fail=1
+          else
+            echo "direct-IP DNS to 8.8.8.8 blocked as expected"
+          fi
+          if timeout 5 curl -sS -o /dev/null --max-time 4 https://1.1.1.1; then
+            echo "::error::direct-IP HTTPS to 1.1.1.1 was NOT blocked in enforce mode"; fail=1
+          else
+            echo "direct-IP HTTPS to 1.1.1.1 blocked as expected"
+          fi
+          exit $fail

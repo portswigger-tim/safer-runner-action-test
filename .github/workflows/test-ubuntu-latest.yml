@@ -1,0 +1,42 @@
+name: Test (ubuntu-latest)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Weekly, to catch GitHub runner-image drift before consumers hit it.
+    - cron: '17 6 * * 1'
+
+jobs:
+  suite:
+    name: ubuntu-latest
+    uses: ./.github/workflows/suite.yml
+    with:
+      os: ubuntu-latest
+
+  ubuntu-latest-soak:
+    name: ubuntu-latest soak ${{ matrix.rep }} (enforce + disable-sudo)
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3, 4, 5]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply Safer Runner Action (enforce + disable-sudo)
+        uses: portswigger-tim/safer-runner-action@main
+        with:
+          mode: 'enforce'
+          allowed-domains: 'api.github.com'
+      - name: dnsmasq started and an allowed domain resolves on this VM
+        run: |
+          echo ":53 listeners:"; sudo ss -lntup 'sport = :53' || true
+          ans=$(dig +short +time=5 +tries=2 @127.0.0.1 api.github.com A || true)
+          echo "api.github.com A -> ${ans:-<empty>}"
+          if [ -z "$ans" ]; then
+            echo "::error::dnsmasq up but allowed domain did not resolve on this VM"; exit 1
+          fi
