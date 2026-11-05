@@ -324,7 +324,8 @@ baseline() {
   [ $rc -ne 0 ]; pass_if M1.runner-cannot-write $? "runner write -> rc=$rc ${out: -80}"
   out=$(cat "$f" 2>&1); rc=$?
   [ $rc -ne 0 ]; pass_if M1.runner-cannot-read $? "runner cat -> rc=$rc ${out: -80}"
-  out=$(sudo -n cat "$f" 2>&1 | jq -r '.files | length' 2>&1)
+  # stderr dropped: sudo warns 'unable to resolve host' on AWS-hosted VMs (hostname not in /etc/hosts)
+  out=$(sudo -n cat "$f" 2>/dev/null | jq -r '.files | length' 2>&1)
   [[ "$out" =~ ^[1-9][0-9]*$ ]]; pass_if M1.validation-read-allowed $? "sudo -n cat (exact allowlist entry) -> $out files in baseline"
 }
 
