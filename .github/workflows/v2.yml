@@ -45,7 +45,7 @@ jobs:
     steps:
       # Default enforce: since beta.2 this removes sudo (disable-sudo unset = on in enforce, H2)
       - name: safer-runner v2 (enforce, defaults)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.2
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -128,7 +128,7 @@ jobs:
     steps:
       # Explicit opt-out: sudo kept, job labelled "enforce (ADVISORY - sudo retained)" (H2)
       - name: safer-runner v2 (enforce, sudo retained)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.2
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -169,7 +169,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (analyze)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.2
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: analyze
       - uses: actions/checkout@v7
@@ -212,7 +212,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (enforce, strict privilege layer)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.2
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: enforce
           disable-sudo: true
