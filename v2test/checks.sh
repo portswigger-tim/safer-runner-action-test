@@ -258,7 +258,7 @@ ssrf() {
   # IMDS by an allowlisted name, dialled directly: 169.254.169.254:80 is exempt from the REDIRECT
   # (the platform needs it), so this reaches IMDS exactly like the IP literal does. Informational.
   out=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H 'Metadata: true' 'http://169.254.169.254.nip.io/metadata/instance?api-version=2021-02-01' 2>&1); local rc=$?
-  record H1.imds-by-name INFO "http://169.254.169.254.nip.io/metadata/instance -> rc=$rc '${out: -60}' (same reachability as http://169.254.169.254/, by design)"
+  record H1.imds-by-name INFO "http://169.254.169.254.nip.io/metadata/instance -> rc=$rc HTTP $out (same reachability as http://169.254.169.254/, by design)"
 
   # through the proxy: the IP guard refuses and logs the internal address it resolved
   expect_upstream_refused H1.proxy-imds-http "Host 169.254.169.254.nip.io dialled at $ATTACKER_IP (plain HTTP)" 169.254.169.254 \
