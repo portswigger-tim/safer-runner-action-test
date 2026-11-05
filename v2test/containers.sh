@@ -17,11 +17,14 @@ JAVA=eclipse-temurin:21-jdk
 NGINX=nginx:alpine
 IMAGES="$CURL $DEB $PY $NODE $JAVA $NGINX"
 
-# drun <docker run args...> -> last non-empty output line, rc in $RC
-drun() { local out; out=$(timeout 150 docker run --rm "$@" 2>&1); RC=$?; grep -v '^\s*$' <<<"$out" | tail -1 | cut -c1-160; }
+# drun <docker run args...> -> sets R (last non-empty output line) and RC. Call it directly,
+# never inside $(...): a subshell would lose both.
+drun() { local out; out=$(timeout 150 docker run --rm "$@" 2>&1); RC=$?; R=$(grep -v '^\s*$' <<<"$out" | tail -1 | cut -c1-160); }
+# a section that dies (set -u, a typo) must fail the job, not vanish behind `|| true`
+trap 'rc=$?; [ $rc -ne 0 ] && record "harness.${1:-?}" FAIL "section exited $rc before finishing"' EXIT
 # container_rec <mark> <jq-cond>: first flow record from the container listener matching cond
 container_rec() { flows_q "$1" ".source==\"container\" and ($2)" | head -1; }
-dns_seen() { grep -c "$1" "$DNSLOG" 2>/dev/null || echo 0; }
+dns_seen() { local n; n=$(grep -c "$1" "$DNSLOG" 2>/dev/null); echo "${n:-0}"; }
 
 case "$1" in
 
@@ -54,33 +57,33 @@ probe-log) # health-cmd probe inside the service: run under default enforce (no 
   ;;
 
 traffic) # G1-G3 / T1-T3 / T5-T7
-  r=$(drun $CURL -sS -m 15 -o /dev/null -w '%{http_code}' https://example.org); [ $RC -ne 0 ]
+  drun $CURL -sS -m 15 -o /dev/null -w '%{http_code}' https://example.org; r=$R; [ $RC -ne 0 ]
   pass_if G1.https-denied-dns $? "container https://example.org (DNS) -> rc=$RC $r"
-  m=$(mark); r=$(drun --add-host example.org:$ATTACKER_IP $CURL -sS -m 15 -o /dev/null -w '%{http_code}' https://example.org); sleep 0.5
+  m=$(mark); drun --add-host example.org:$ATTACKER_IP $CURL -sS -m 15 -o /dev/null -w '%{http_code}' https://example.org; r=$R; sleep 0.5
   rec=$(container_rec "$m" '.verdict=="BLOCK" and .sni=="example.org"')
   [ $RC -ne 0 ] && [ -n "$rec" ]; pass_if G1.https-denied-proxy $? "container https://example.org forced to $ATTACKER_IP -> rc=$RC $r; ${rec:0:200}"
-  r=$(drun $DEB bash -c 'timeout 5 bash -c "</dev/tcp/1.1.1.1/853" && echo OPEN || echo closed'); [ "$r" = closed ]
+  drun $DEB bash -c 'timeout 5 bash -c "</dev/tcp/1.1.1.1/853" && echo OPEN || echo closed'; r=$R; [ "$r" = closed ]
   pass_if G2.port853 $? "container tcp 1.1.1.1:853 -> $r"
-  r=$(drun $CURL -sS -m 8 -o /dev/null -w '%{http_code}' -H Metadata:true 'http://169.254.169.254/metadata/instance?api-version=2021-02-01'); [ "$r" != 200 ]
+  drun $CURL -sS -m 8 -o /dev/null -w '%{http_code}' -H Metadata:true 'http://169.254.169.254/metadata/instance?api-version=2021-02-01'; r=$R; [ "$r" != 200 ]
   pass_if G3.imds $? "container -> IMDS -> $r"
-  m=$(mark); r=$(drun $CURL -sS -m 20 -o /dev/null -w '%{http_code}' "$OK_URL"); sleep 0.5
+  m=$(mark); drun $CURL -sS -m 20 -o /dev/null -w '%{http_code}' "$OK_URL"; r=$R; sleep 0.5
   rec=$(container_rec "$m" '.sni=="github.com" and .reason=="container-sni-only" and .repointed==true')
   [ "$r" = 200 ] && [ -n "$rec" ]; pass_if T1.allowed-no-ca $? "container (no CA) $OK_URL -> $r; ${rec:0:200}"
-  m=$(mark); r=$(drun --add-host example.org:$ATTACKER_IP $CURL -sS -m 10 -o /dev/null -w '%{http_code}' http://example.org); sleep 0.5
+  m=$(mark); drun --add-host example.org:$ATTACKER_IP $CURL -sS -m 10 -o /dev/null -w '%{http_code}' http://example.org; r=$R; sleep 0.5
   rec=$(container_rec "$m" '.verdict=="BLOCK" and .reason=="host-not-allowed"')
   [ "$r" != 200 ] && [ -n "$rec" ]; pass_if T2.http-denied $? "container http://example.org -> $r; ${rec:0:200}"
-  r=$(drun $CURL -sS -m 10 -k -o /dev/null -w '%{http_code}' https://1.1.1.1); [ $RC -ne 0 ]
+  drun $CURL -sS -m 10 -k -o /dev/null -w '%{http_code}' https://1.1.1.1; r=$R; [ $RC -ne 0 ]
   pass_if T3.ip-literal $? "container https://1.1.1.1 -> rc=$RC $r"
   docker network create v2net >/dev/null 2>&1
   docker run -d --rm --name web --network v2net $NGINX >/dev/null; sleep 2
-  r=$(drun --network v2net $CURL -sS -m 10 -o /dev/null -w '%{http_code}' http://web/); [ "$r" = 200 ]
+  drun --network v2net $CURL -sS -m 10 -o /dev/null -w '%{http_code}' http://web/; r=$R; [ "$r" = 200 ]
   pass_if T5.c2c $? "container -> nginx container on a user network :80 -> $r"
   docker rm -f web >/dev/null 2>&1
   ( sudo -n python3 -m http.server 80 --bind 0.0.0.0 --directory /tmp >/dev/null 2>&1 & ); sleep 1
-  r=$(drun $CURL -sS -m 10 -o /dev/null -w '%{http_code}' http://172.17.0.1/); [ "$r" = 200 ]
+  drun $CURL -sS -m 10 -o /dev/null -w '%{http_code}' http://172.17.0.1/; r=$R; [ "$r" = 200 ]
   pass_if T6.c2host $? "container -> host 172.17.0.1:80 -> $r"
   sudo -n pkill -f 'http.server 80' || true
-  m=$(mark); r=$(drun --network host --add-host example.org:$ATTACKER_IP $CURL -sS -m 10 -o /dev/null https://example.org); sleep 0.5
+  m=$(mark); drun --network host --add-host example.org:$ATTACKER_IP $CURL -sS -m 10 -o /dev/null https://example.org; r=$R; sleep 0.5
   rec=$(flows_q "$m" '.verdict=="BLOCK" and .sni=="example.org" and (.source // "host")=="host"' | head -1)
   [ $RC -ne 0 ] && [ -n "$rec" ]; pass_if T7.hostnet $? "--network host container = host path (source host): rc=$RC; ${rec:0:200}"
   ;;
@@ -108,21 +111,21 @@ d,a=s.recvfrom(512);print('rcode',d[3]&15,'from',a)" 2>&1 | tail -1)
   ;;
 
 posture) # container-tls sni-only (default): no CA in any image; host still intercepted
-  r=$(drun $NODE node -e "fetch('$OK_URL').then(r=>console.log(r.status)).catch(e=>{console.log(String(e.cause||e));process.exit(1)})")
+  drun $NODE node -e "fetch('$OK_URL').then(r=>console.log(r.status)).catch(e=>{console.log(String(e.cause||e));process.exit(1)})"; r=$R
   [ "$r" = 200 ]; pass_if P.node-no-ca $? "node:22 fetch $OK_URL -> $r"
-  r=$(drun -v "$here:/t:ro" $JAVA java /t/Get.java "$OK_URL"); [ "$r" = 200 ]
+  drun -v "$here:/t:ro" $JAVA java /t/Get.java "$OK_URL"; r=$R; [ "$r" = 200 ]
   pass_if P.java-no-ca $? "temurin HttpURLConnection -> $r"
-  r=$(drun $PY sh -c "pip install -q --disable-pip-version-check --root-user-action=ignore requests >/dev/null 2>&1; python3 -c \"import requests;print(requests.get('$OK_URL',timeout=20).status_code)\"")
+  drun $PY sh -c "pip install -q --disable-pip-version-check --root-user-action=ignore requests >/dev/null 2>&1; python3 -c \"import requests;print(requests.get('$OK_URL',timeout=20).status_code)\""; r=$R
   [ "$r" = 200 ]; pass_if P.requests-no-ca $? "pip install requests + requests.get (certifi) -> $r"
   m=$(mark); out=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' "$OK_URL" 2>&1); sleep 0.5
   rec=$(flows_q "$m" '.ev=="tls" and .sni=="github.com" and .verdict=="INTERCEPT" and .source=="host"' | head -1)
   [ -n "$rec" ]; pass_if P.host-still-intercepted $? "host curl $OK_URL -> $out; ${rec:0:200}"
-  r=$(drun $DEB curl -sS -m 15 -o /dev/null -w '%{http_code}' --connect-to ::github.com:443 -H 'Host: gist.github.com' https://github.com/)
+  drun $DEB curl -sS -m 15 -o /dev/null -w '%{http_code}' --connect-to ::github.com:443 -H 'Host: gist.github.com' https://github.com/; r=$R
   record P.fronting-under-sni-only INFO "container SNI github.com + Host gist.github.com -> $r (documented limitation of sni-only)"
   ;;
 
 front-door) # <enforce|analyze>: Azure Storage stays intercepted for containers in enforce
-  m=$(mark); r=$(drun $CURL -sS -m 15 -o /dev/null -w '%{http_code}' "$FD_URL"); sleep 0.5
+  m=$(mark); drun $CURL -sS -m 15 -o /dev/null -w '%{http_code}' "$FD_URL"; r=$R; sleep 0.5
   if [ "$2" = enforce ]; then
     rec=$(container_rec "$m" '.reason=="container-front-door" and .verdict=="INTERCEPT"')
     [ $RC -ne 0 ] && [ -n "$rec" ]; pass_if P.front-door-intercepted $? "container (no CA) $FD_URL -> rc=$RC $r (TLS fails: intercepted); ${rec:0:200}"
@@ -134,7 +137,7 @@ front-door) # <enforce|analyze>: Azure Storage stays intercepted for containers 
 
 failclosed) # T4: a hole in the DNAT still fails closed in DOCKER-USER (needs sudo: advisory job)
   sudo -n iptables -t nat -I SAFER_RUNNER_CNAT 1 -p tcp --dport 443 -j RETURN
-  r=$(drun $CURL -sS -m 10 -k -o /dev/null -w '%{http_code}' https://1.1.1.1)
+  drun $CURL -sS -m 10 -k -o /dev/null -w '%{http_code}' https://1.1.1.1; r=$R
   n=$(sudo -n iptables -L SAFER_RUNNER_CFWD -v -n | awk '/REJECT/ && /tcp/ {print $1; exit}')
   sudo -n iptables -t nat -D SAFER_RUNNER_CNAT -p tcp --dport 443 -j RETURN
   [ $RC -ne 0 ] && [ "${n:-0}" != 0 ]; pass_if T4.failclosed $? "443 DNAT removed: container https://1.1.1.1 -> rc=$RC $r (SAFER_RUNNER_CFWD tcp REJECT pkts=$n)"
@@ -145,7 +148,7 @@ failclosed) # T4: a hole in the DNAT still fails closed in DOCKER-USER (needs su
 restart) # T8: rules survive dockerd restarting (it re-creates its own chains)
   sudo -n systemctl restart docker; sleep 3
   n=$(sudo -n iptables -S DOCKER-USER | grep -c SAFER_RUNNER_CFWD); p=$(sudo -n iptables -t nat -S PREROUTING | grep -c SAFER_RUNNER_CNAT)
-  r=$(drun --add-host example.org:$ATTACKER_IP $CURL -sS -m 10 -o /dev/null https://example.org)
+  drun --add-host example.org:$ATTACKER_IP $CURL -sS -m 10 -o /dev/null https://example.org; r=$R
   [ "$n" -ge 2 ] && [ "$p" -ge 2 ] && [ $RC -ne 0 ]
   pass_if T8.restart-survival $? "after dockerd restart: DOCKER-USER jumps=$n PREROUTING jumps=$p; forced example.org rc=$RC"
   ;;
@@ -160,12 +163,12 @@ build) # docker build RUN under sni-only: allowlisted works with no CA, denied r
   ;;
 
 analyze) # analyze must not break containers
-  r=$(drun $CURL -sS -m 20 -o /dev/null -w '%{http_code}' "$OK_URL"); [ "$r" = 200 ]
+  drun $CURL -sS -m 20 -o /dev/null -w '%{http_code}' "$OK_URL"; r=$R; [ "$r" = 200 ]
   pass_if AZ.allowed-no-ca $? "container (no CA) $OK_URL -> $r"
-  m=$(mark); r=$(drun $CURL -sS -m 20 -o /dev/null -w '%{http_code}' https://example.org); sleep 0.5
+  m=$(mark); drun $CURL -sS -m 20 -o /dev/null -w '%{http_code}' https://example.org; r=$R; sleep 0.5
   rec=$(container_rec "$m" '.verdict=="WOULD_BLOCK"')
   [ "$r" = 200 ] && [ -n "$rec" ]; pass_if AZ.would-block-works $? "container https://example.org -> $r; ${rec:0:200}"
-  r=$(drun $DEB bash -c 'timeout 5 bash -c "</dev/tcp/1.1.1.1/853" && echo OPEN || echo closed')
+  drun $DEB bash -c 'timeout 5 bash -c "</dev/tcp/1.1.1.1/853" && echo OPEN || echo closed'; r=$R
   sleep 2; n=$(grep -c 'SaferRunner-CEgress' /var/log/safer-runner/firewall.log 2>/dev/null)
   [ "$r" = OPEN ] && [ "${n:-0}" -gt 0 ]; pass_if AZ.port853-logged $? "container tcp 1.1.1.1:853 -> $r; CEgress lines: $n"
   ;;
