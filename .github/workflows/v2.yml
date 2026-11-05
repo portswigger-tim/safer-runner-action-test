@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run only this job (enforce|advisory|analyze|strict|containers), or all'
+        description: 'Run only this job (enforce|advisory|analyze|strict|crash|containers), or all'
         required: false
         default: 'all'
 
@@ -238,6 +238,45 @@ jobs:
       - name: results
         if: always()
         run: source v2test/lib.sh && finish "strict / ${{ matrix.os }}"
+
+  # T9: the controls survive their own processes being killed. enforce + sudo retained (ADVISORY)
+  # so the checks can SIGKILL the units; fail-on-tampering off because we disrupt on purpose.
+  crash-recovery:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'crash' }}
+    name: crash-recovery (enforce, sudo retained) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - name: safer-runner v2 (enforce, sudo retained so the checks can kill the units)
+        uses: portswigger-tim/safer-runner-action@39582fe5af85a712b828f2c1fe9d8b2101806364
+        with:
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
+          disable-sudo: false
+          fail-on-tampering: false
+      - uses: actions/checkout@v7
+      - name: SIGKILL proxy + CoreDNS; assert restart, CA reuse, egress + enforcement recover
+        run: v2test/checks.sh crash-recovery || true
+      - name: results
+        if: always()
+        run: source v2test/lib.sh && finish "crash-recovery / ${{ matrix.os }}"
+      - name: evidence
+        if: always()
+        run: |
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          sudo journalctl -u safer-runner-proxy --no-pager > evidence/proxy-journal.txt 2>&1 || true
+          sudo journalctl -u safer-runner-dns --no-pager > evidence/dns-journal.txt 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-crash-recovery-${{ matrix.os }}
+          path: evidence/
+          retention-days: 7
 
   # P2: container egress. ADVISORY (sudo + docker kept) so the checks can drive docker and poke
   # the rules; a service container started by the runner BEFORE the action exercises F1.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # safer-runner v2 real-runner checks.
-# usage: checks.sh <must-pass|must-fail|sudo-must-fail|ssrf|analyze|strict|privilege-removed|privilege-retained|baseline>
+# usage: checks.sh <must-pass|must-fail|sudo-must-fail|ssrf|analyze|strict|privilege-removed|privilege-retained|crash-recovery|baseline>
 set -u
 cd "$(dirname "$0")/.."
 source v2test/lib.sh
@@ -376,6 +376,59 @@ strict() {
 
 privilege_removed() { privilege no; }
 privilege_retained() { privilege yes; }
+
+# T9 crash-recovery: SIGKILL the proxy and the resolver, prove systemd brings each back, the
+# public CA is reused (so trust set up at boot still holds), egress recovers, and enforcement
+# (proxy SNI allowlist + CoreDNS default-deny) is intact afterwards. Needs sudo -> advisory job.
+crash_recovery() {
+  local CA=/etc/safer-runner/ca.pem
+  local before after code issuer out m rec
+  local p_r0 p_pid0 p_pid1 d_r0 d_pid0 d_pid1
+  wait_active() { local u=$1 t=${2:-30} i=0; while [ "$i" -lt "$t" ]; do systemctl is-active -q "$u" && return 0; sleep 1; i=$((i+1)); done; return 1; }
+
+  before=$(openssl x509 -in "$CA" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+  code=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
+  [ "$code" = 200 ]; pass_if CR.pre-egress $? "api.github.com/zen -> $code before any kill; CA $before"
+
+  # --- proxy SIGKILL ---
+  p_r0=$(systemctl show -p NRestarts --value safer-runner-proxy)
+  p_pid0=$(systemctl show -p MainPID --value safer-runner-proxy)
+  sudo -n systemctl kill -s KILL safer-runner-proxy
+  wait_active safer-runner-proxy 30; pass_if CR.proxy-restarts $? "safer-runner-proxy active after SIGKILL; NRestarts $p_r0 -> $(systemctl show -p NRestarts --value safer-runner-proxy)"
+  p_pid1=$(systemctl show -p MainPID --value safer-runner-proxy)
+  [ -n "$p_pid1" ] && [ "$p_pid1" != 0 ] && [ "$p_pid1" != "$p_pid0" ]; pass_if CR.proxy-new-pid $? "MainPID $p_pid0 -> $p_pid1"
+  # the public CA on disk (what clients were told to trust) is reused, not regenerated
+  after=$(openssl x509 -in "$CA" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+  [ -n "$before" ] && [ "$before" = "$after" ]; pass_if CR.proxy-ca-stable $? "CA sha256 unchanged across restart ($after)"
+  # egress recovers through the restarted proxy, still served by our CA
+  code=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
+  issuer=$(echo | timeout 15 openssl s_client -connect api.github.com:443 -servername api.github.com 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)
+  [ "$code" = 200 ] && grep -q safer-runner <<<"$issuer"; pass_if CR.proxy-egress-recovers $? "api.github.com/zen -> $code after restart; cert $issuer"
+  # enforcement intact: a non-allowlisted SNI (forced to reach the proxy) is still blocked + logged
+  expect_blocked CR.proxy-enforce-after "https://example.org (forced to \$ATTACKER_IP) after proxy restart" \
+    '.ev=="tls" and .sni=="example.org" and .verdict=="BLOCK"' \
+    curl -k -sS -m 15 -o /dev/null -w '%{http_code}' --resolve "example.org:443:$ATTACKER_IP" https://example.org/
+
+  # --- CoreDNS SIGKILL ---
+  d_r0=$(systemctl show -p NRestarts --value safer-runner-dns)
+  d_pid0=$(systemctl show -p MainPID --value safer-runner-dns)
+  sudo -n systemctl kill -s KILL safer-runner-dns
+  wait_active safer-runner-dns 30; pass_if CR.dns-restarts $? "safer-runner-dns active after SIGKILL; NRestarts $d_r0 -> $(systemctl show -p NRestarts --value safer-runner-dns)"
+  d_pid1=$(systemctl show -p MainPID --value safer-runner-dns)
+  [ -n "$d_pid1" ] && [ "$d_pid1" != 0 ] && [ "$d_pid1" != "$d_pid0" ]; pass_if CR.dns-new-pid $? "MainPID $d_pid0 -> $d_pid1"
+  # an allowlisted name resolves again
+  out=$(dig +short +time=3 +tries=2 @127.0.0.1 registry.npmjs.org A 2>&1)
+  [ -n "$out" ]; pass_if CR.dns-allowed-resolves $? "dig registry.npmjs.org -> $(tr '\n' ' ' <<<"$out")"
+  # default-deny survived the restart: a non-allowlisted name is still NXDOMAIN
+  out=$(dig +time=3 +tries=2 @127.0.0.1 evil.example.org A 2>&1)
+  grep -q 'status: NXDOMAIN' <<<"$out"; pass_if CR.dns-deny-after $? "dig evil.example.org -> $(grep -oE 'status: [A-Z]+' <<<"$out" | head -1)"
+
+  # --- both at once ---
+  sudo -n systemctl kill -s KILL safer-runner-proxy safer-runner-dns
+  { wait_active safer-runner-proxy 30 && wait_active safer-runner-dns 30; }; pass_if CR.both-restart $? "proxy + dns both active after a simultaneous SIGKILL"
+  code=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
+  [ "$code" = 200 ]; pass_if CR.both-egress-recovers $? "api.github.com/zen -> $code after killing proxy+dns together"
+}
 
 trap 'record "harness.$1" FAIL "checks.sh $1 aborted (line $LINENO)"' EXIT
 "${1//-/_}"
