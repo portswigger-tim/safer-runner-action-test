@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run only this job (enforce|advisory|analyze|strict|crash|containers), or all'
+        description: 'Run only this job (enforce|advisory|analyze|strict|crash|containers|supply-chain), or all'
         required: false
         default: 'all'
 
@@ -116,6 +116,44 @@ jobs:
         if: always()
         with:
           name: evidence-enforce-${{ matrix.os }}
+          path: evidence/
+          retention-days: 7
+
+  # Real-world supply-chain attack replays: reproduce the behaviour of named 2024-2025 incidents
+  # (tj-actions/changed-files, Shai-Hulud npm worm, curl|bash stagers, SUNBURST-style DNS tunnelling,
+  # dependency confusion) with FAKE canary secrets and self-contained non-allowlisted sinks, and prove
+  # enforce stops the exfil before anything leaves. Default enforce (sudo + docker removed) = the real
+  # threat model: a malicious step running as the runner user after the action has hardened egress.
+  supply-chain:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'supply-chain' }}
+    name: supply-chain attack replay (enforce) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04]
+    steps:
+      - name: safer-runner v2 (enforce, defaults)
+        uses: portswigger-tim/safer-runner-action@v2.0.0
+        with:
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
+      - uses: actions/checkout@v7
+      - name: replay recent supply-chain attacks (every exfil must be blocked)
+        run: v2test/checks.sh supply-chain || true
+      - name: results
+        if: always()
+        run: source v2test/lib.sh && finish "supply-chain / ${{ matrix.os }}"
+      - name: evidence
+        if: always()
+        run: |
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-supply-chain-${{ matrix.os }}
           path: evidence/
           retention-days: 7
 
