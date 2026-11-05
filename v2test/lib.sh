@@ -53,7 +53,21 @@ never_reached() {
   fi
 }
 
+# Refused names in GitHub's zones (DNS + proxy), minus the suite's own probes: a name the
+# exact-by-default GitHub list misses shows up here (e.g. a bare apex) before it breaks a job.
+github_refusals() {
+  local zones='(^|\.)(github\.com|githubusercontent\.com|githubapp\.com|ghcr\.io|blob\.core\.windows\.net)$'
+  local probes='^(srst-|[swc][0-9a-f]{20}\.|c[0-9]+\.github\.com$|gist\.|raw\.githubusercontent)'
+  local names
+  names=$( { grep -oE ' (BLOCK|WOULD_BLOCK) [A-Z]+ [^ ]+' /var/log/safer-runner/dns.log 2>/dev/null | awk '{print $3}' | sed 's/\.$//'
+             jq -r 'select(.verdict=="BLOCK" or .verdict=="WOULD_BLOCK") | (.sni // .host // empty)' "$FLOWLOG" 2>/dev/null; } \
+           | tr 'A-Z' 'a-z' | grep -E "$zones" | grep -vE "$probes" | sort | uniq -c | sort -rn | head -20 | awk '{printf "%s(%s) ", $2, $1}')
+  if [ -z "$names" ]; then record G.github-refusals PASS "no refused names in GitHub zones (DNS or proxy)"
+  else record G.github-refusals INFO "REFUSED in GitHub zones: $names"; fi
+}
+
 finish() {
+  github_refusals
   echo "=== RESULTS"; column -t -s $'\t' "$RESULTS" || cat "$RESULTS"
   {
     echo "## v2 suite: $1"
