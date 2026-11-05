@@ -33,6 +33,10 @@ pull) # F1: the runner pulled the service image BEFORE the action; dockerd must 
   out=$(timeout 180 docker pull -q busybox:1.37 2>&1 | tail -1); rc=$?
   [ $rc -eq 0 ] && ! grep -q x509 <<<"$out"
   pass_if F1.pull-after-service $? "docker pull busybox (dockerd did TLS before the action): rc=$rc ${out:0:160}"
+  # ghcr: registry API on ghcr.io (exact) + blobs 307'd to pkg-containers.githubusercontent.com (exact), no *.ghcr.io
+  out=$(timeout 180 docker pull -q ghcr.io/containerd/busybox:1.36 2>&1 | tail -1); rc=$?
+  [ $rc -eq 0 ] && ! grep -qi 'error' <<<"$out"
+  pass_if A.ghcr-pull $? "docker pull ghcr.io/containerd/busybox:1.36 -> rc=$rc ${out:0:160}"
   : > "$RUNNER_TEMP/pull.txt"
   for i in $IMAGES; do (timeout 300 docker pull -q "$i" >/dev/null 2>&1; echo "$i rc=$?" >> "$RUNNER_TEMP/pull.txt") & done; wait
   ! grep -qv 'rc=0' "$RUNNER_TEMP/pull.txt"; pass_if F1.pulls $? "$(sort "$RUNNER_TEMP/pull.txt" | tr '\n' ' ')"

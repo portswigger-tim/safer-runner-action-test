@@ -235,7 +235,7 @@ sudo_must_fail() {
   sudo systemctl kill -s KILL safer-runner-dns
   t0=$(date +%s.%N); out=""
   for _ in $(seq 1 30); do
-    out=$(dig +short +time=1 +tries=1 github.com A | head -1); [ -n "$out" ] && break
+    out=$(dig +short +time=1 +tries=1 github.com A 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -1); [ -n "$out" ] && break
     sleep 0.5
   done
   [ -n "$out" ]
