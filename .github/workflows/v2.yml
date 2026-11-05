@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run only this job (enforce|advisory|analyze|strict), or all'
+        description: 'Run only this job (enforce|advisory|analyze|strict|containers), or all'
         required: false
         default: 'all'
 
@@ -29,6 +29,8 @@ env:
     docker.io docker.com
     nip.io sslip.io
   PASSTHROUGH: 100-64-0-1.sslip.io pt-hosts.sslip.io
+  # service-container egress probe (v2test/probe.py, base64), run by the service's health-cmd
+  PROBE: IyBTZXJ2aWNlLWNvbnRhaW5lciBlZ3Jlc3MgcHJvYmUgKHJ1biBieSB0aGUgc2VydmljZSdzIGhlYWx0aC1jbWQgZXZlcnkgZmV3IHNlY29uZHMpLgppbXBvcnQgc29ja2V0LCBzc2wsIHRpbWUsIHVybGxpYi5yZXF1ZXN0CmRlZiB0KG5hbWUsIGZuKToKICAgIHRyeToKICAgICAgICByID0gZm4oKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHIgPSAiRVJSICIgKyB0eXBlKGUpLl9fbmFtZV9fICsgIjogIiArIHN0cihlKVs6OTBdCiAgICBwcmludCh0aW1lLnN0cmZ0aW1lKCIlSDolTTolUyIpLCBuYW1lLCByLCBmbHVzaD1UcnVlKQp0KCJkbnMtZXhhbXBsZS5vcmciLCBsYW1iZGE6IHNvY2tldC5nZXRob3N0YnluYW1lKCJleGFtcGxlLm9yZyIpKQp0KCJodHRwcy1leGFtcGxlLm9yZyIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9leGFtcGxlLm9yZyIsIHRpbWVvdXQ9Nikuc3RhdHVzKQp0KCJodHRwLWV4YW1wbGUub3JnIiwgbGFtYmRhOiB1cmxsaWIucmVxdWVzdC51cmxvcGVuKCJodHRwOi8vZXhhbXBsZS5vcmciLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgiaHR0cHMtZ2l0aHViLmNvbSIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9naXRodWIuY29tL3JvYm90cy50eHQiLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgidGNwLTEuMS4xLjE6ODUzIiwgbGFtYmRhOiBzb2NrZXQuY3JlYXRlX2Nvbm5lY3Rpb24oKCIxLjEuMS4xIiwgODUzKSwgdGltZW91dD01KS5jbG9zZSgpIG9yICJjb25uZWN0ZWQiKQo=
   # authenticated api.github.com calls (the unauthenticated per-IP limit returns 403 on shared runner IPs)
   GH_TOKEN: ${{ github.token }}
 
@@ -45,7 +47,7 @@ jobs:
     steps:
       # Default enforce: since beta.2 this removes sudo (disable-sudo unset = on in enforce, H2)
       - name: safer-runner v2 (enforce, defaults)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.3
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -128,7 +130,7 @@ jobs:
     steps:
       # Explicit opt-out: sudo kept, job labelled "enforce (ADVISORY - sudo retained)" (H2)
       - name: safer-runner v2 (enforce, sudo retained)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.3
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -169,7 +171,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (analyze)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.3
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: analyze
       - uses: actions/checkout@v7
@@ -212,7 +214,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (enforce, strict privilege layer)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.3
+        uses: portswigger-tim/safer-runner-action@v2
         with:
           mode: enforce
           disable-sudo: true
@@ -235,3 +237,162 @@ jobs:
       - name: results
         if: always()
         run: source v2test/lib.sh && finish "strict / ${{ matrix.os }}"
+
+  # P2: container egress. ADVISORY (sudo + docker kept) so the checks can drive docker and poke
+  # the rules; a service container started by the runner BEFORE the action exercises F1.
+  containers:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'containers' }}
+    name: containers (enforce, docker kept) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
+    services:
+      svc:
+        image: python:3.12-slim
+        env:
+          PROBE: IyBTZXJ2aWNlLWNvbnRhaW5lciBlZ3Jlc3MgcHJvYmUgKHJ1biBieSB0aGUgc2VydmljZSdzIGhlYWx0aC1jbWQgZXZlcnkgZmV3IHNlY29uZHMpLgppbXBvcnQgc29ja2V0LCBzc2wsIHRpbWUsIHVybGxpYi5yZXF1ZXN0CmRlZiB0KG5hbWUsIGZuKToKICAgIHRyeToKICAgICAgICByID0gZm4oKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHIgPSAiRVJSICIgKyB0eXBlKGUpLl9fbmFtZV9fICsgIjogIiArIHN0cihlKVs6OTBdCiAgICBwcmludCh0aW1lLnN0cmZ0aW1lKCIlSDolTTolUyIpLCBuYW1lLCByLCBmbHVzaD1UcnVlKQp0KCJkbnMtZXhhbXBsZS5vcmciLCBsYW1iZGE6IHNvY2tldC5nZXRob3N0YnluYW1lKCJleGFtcGxlLm9yZyIpKQp0KCJodHRwcy1leGFtcGxlLm9yZyIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9leGFtcGxlLm9yZyIsIHRpbWVvdXQ9Nikuc3RhdHVzKQp0KCJodHRwLWV4YW1wbGUub3JnIiwgbGFtYmRhOiB1cmxsaWIucmVxdWVzdC51cmxvcGVuKCJodHRwOi8vZXhhbXBsZS5vcmciLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgiaHR0cHMtZ2l0aHViLmNvbSIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9naXRodWIuY29tL3JvYm90cy50eHQiLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgidGNwLTEuMS4xLjE6ODUzIiwgbGFtYmRhOiBzb2NrZXQuY3JlYXRlX2Nvbm5lY3Rpb24oKCIxLjEuMS4xIiwgODUzKSwgdGltZW91dD01KS5jbG9zZSgpIG9yICJjb25uZWN0ZWQiKQo=
+        volumes:
+          - /tmp/svcout:/out
+        options: >-
+          -i --health-cmd "echo $PROBE | base64 -d | python3 >> /out/log 2>&1; true"
+          --health-interval 5s --health-timeout 45s --health-retries 10000
+    steps:
+      - name: safer-runner v2 (enforce, sudo + docker kept)
+        uses: portswigger-tim/safer-runner-action@v2
+        with:
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
+          disable-sudo: false
+          disable-docker: false
+      - uses: actions/checkout@v7
+      - name: F1 - docker pull after a pre-action service pull
+        run: v2test/containers.sh pull || true
+      - name: service container by name
+        run: v2test/containers.sh service ${{ job.services.svc.id }} || true
+      - name: traffic (G1-G3, T1-T3, T5-T7)
+        run: v2test/containers.sh traffic || true
+      - name: container DNS (N1-N3)
+        run: v2test/containers.sh dns || true
+      - name: posture sni-only (no CA) + host still intercepted
+        run: v2test/containers.sh posture || true
+      - name: multi-tenant front door stays intercepted
+        run: v2test/containers.sh front-door enforce || true
+      - name: docker build RUN
+        run: v2test/containers.sh build || true
+      - name: fail-closed (T4)
+        run: v2test/containers.sh failclosed || true
+      - name: survives a dockerd restart (T8)
+        run: v2test/containers.sh restart || true
+      - name: results
+        if: always()
+        run: source v2test/lib.sh && finish "containers / ${{ matrix.os }}"
+      - name: evidence
+        if: always()
+        run: |
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          cp /tmp/svcout/log evidence/svc-probe.log 2>/dev/null || true
+          sudo iptables-save > evidence/iptables-save.txt 2>&1 || true
+          sudo journalctl -u docker --no-pager -n 200 > evidence/dockerd.txt 2>&1 || true
+          sudo journalctl -u safer-runner-proxy --no-pager > evidence/proxy-journal.txt 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-containers-${{ matrix.os }}
+          path: evidence/
+          retention-days: 7
+
+  # Default enforce (docker + sudo removed from steps): the service container is still contained.
+  containers-default:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'containers' }}
+    name: containers (default enforce) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
+    services:
+      svc:
+        image: python:3.12-slim
+        env:
+          PROBE: IyBTZXJ2aWNlLWNvbnRhaW5lciBlZ3Jlc3MgcHJvYmUgKHJ1biBieSB0aGUgc2VydmljZSdzIGhlYWx0aC1jbWQgZXZlcnkgZmV3IHNlY29uZHMpLgppbXBvcnQgc29ja2V0LCBzc2wsIHRpbWUsIHVybGxpYi5yZXF1ZXN0CmRlZiB0KG5hbWUsIGZuKToKICAgIHRyeToKICAgICAgICByID0gZm4oKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHIgPSAiRVJSICIgKyB0eXBlKGUpLl9fbmFtZV9fICsgIjogIiArIHN0cihlKVs6OTBdCiAgICBwcmludCh0aW1lLnN0cmZ0aW1lKCIlSDolTTolUyIpLCBuYW1lLCByLCBmbHVzaD1UcnVlKQp0KCJkbnMtZXhhbXBsZS5vcmciLCBsYW1iZGE6IHNvY2tldC5nZXRob3N0YnluYW1lKCJleGFtcGxlLm9yZyIpKQp0KCJodHRwcy1leGFtcGxlLm9yZyIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9leGFtcGxlLm9yZyIsIHRpbWVvdXQ9Nikuc3RhdHVzKQp0KCJodHRwLWV4YW1wbGUub3JnIiwgbGFtYmRhOiB1cmxsaWIucmVxdWVzdC51cmxvcGVuKCJodHRwOi8vZXhhbXBsZS5vcmciLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgiaHR0cHMtZ2l0aHViLmNvbSIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9naXRodWIuY29tL3JvYm90cy50eHQiLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgidGNwLTEuMS4xLjE6ODUzIiwgbGFtYmRhOiBzb2NrZXQuY3JlYXRlX2Nvbm5lY3Rpb24oKCIxLjEuMS4xIiwgODUzKSwgdGltZW91dD01KS5jbG9zZSgpIG9yICJjb25uZWN0ZWQiKQo=
+        volumes:
+          - /tmp/svcout:/out
+        options: >-
+          -i --health-cmd "echo $PROBE | base64 -d | python3 >> /out/log 2>&1; true"
+          --health-interval 5s --health-timeout 45s --health-retries 10000
+    steps:
+      - uses: portswigger-tim/safer-runner-action@v2
+        with:
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+      - uses: actions/checkout@v7
+      - name: service container contained (health-cmd probe)
+        run: v2test/containers.sh probe-log || true
+      - name: results
+        if: always()
+        run: source v2test/lib.sh && finish "containers-default / ${{ matrix.os }}"
+
+  # analyze must not break containers; F1 also applies in analyze
+  containers-analyze:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'containers' }}
+    name: containers (analyze) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
+    services:
+      svc:
+        image: python:3.12-slim
+        env:
+          PROBE: IyBTZXJ2aWNlLWNvbnRhaW5lciBlZ3Jlc3MgcHJvYmUgKHJ1biBieSB0aGUgc2VydmljZSdzIGhlYWx0aC1jbWQgZXZlcnkgZmV3IHNlY29uZHMpLgppbXBvcnQgc29ja2V0LCBzc2wsIHRpbWUsIHVybGxpYi5yZXF1ZXN0CmRlZiB0KG5hbWUsIGZuKToKICAgIHRyeToKICAgICAgICByID0gZm4oKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHIgPSAiRVJSICIgKyB0eXBlKGUpLl9fbmFtZV9fICsgIjogIiArIHN0cihlKVs6OTBdCiAgICBwcmludCh0aW1lLnN0cmZ0aW1lKCIlSDolTTolUyIpLCBuYW1lLCByLCBmbHVzaD1UcnVlKQp0KCJkbnMtZXhhbXBsZS5vcmciLCBsYW1iZGE6IHNvY2tldC5nZXRob3N0YnluYW1lKCJleGFtcGxlLm9yZyIpKQp0KCJodHRwcy1leGFtcGxlLm9yZyIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9leGFtcGxlLm9yZyIsIHRpbWVvdXQ9Nikuc3RhdHVzKQp0KCJodHRwLWV4YW1wbGUub3JnIiwgbGFtYmRhOiB1cmxsaWIucmVxdWVzdC51cmxvcGVuKCJodHRwOi8vZXhhbXBsZS5vcmciLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgiaHR0cHMtZ2l0aHViLmNvbSIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9naXRodWIuY29tL3JvYm90cy50eHQiLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgidGNwLTEuMS4xLjE6ODUzIiwgbGFtYmRhOiBzb2NrZXQuY3JlYXRlX2Nvbm5lY3Rpb24oKCIxLjEuMS4xIiwgODUzKSwgdGltZW91dD01KS5jbG9zZSgpIG9yICJjb25uZWN0ZWQiKQo=
+        volumes:
+          - /tmp/svcout:/out
+        options: >-
+          -i --health-cmd "echo $PROBE | base64 -d | python3 >> /out/log 2>&1; true"
+          --health-interval 5s --health-timeout 45s --health-retries 10000
+    steps:
+      - uses: portswigger-tim/safer-runner-action@v2
+        with:
+          mode: analyze
+      - uses: actions/checkout@v7
+      - name: F1 in analyze
+        run: v2test/containers.sh pull || true
+      - name: no container breakage
+        run: v2test/containers.sh analyze || true
+      - name: front door passes through in analyze
+        run: v2test/containers.sh front-door analyze || true
+      - name: results
+        if: always()
+        run: source v2test/lib.sh && finish "containers-analyze / ${{ matrix.os }}"
+
+  # F3: a job container is unsupported - enforce fails the step, analyze warns
+  job-container:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'containers' }}
+    name: job container (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: node:24-bookworm-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [enforce, analyze]
+    steps:
+      - name: safer-runner v2 in a job container
+        id: sr
+        continue-on-error: true
+        uses: portswigger-tim/safer-runner-action@v2
+        with:
+          mode: ${{ matrix.mode }}
+      - name: results
+        run: |
+          echo "outcome=${{ steps.sr.outcome }}"
+          want=${{ matrix.mode == 'enforce' && 'failure' || 'success' }}
+          echo "## job container (${{ matrix.mode }}): action step ${{ steps.sr.outcome }} (want $want)" >> "$GITHUB_STEP_SUMMARY"
+          [ "${{ steps.sr.outcome }}" = "$want" ]
