@@ -24,10 +24,11 @@ defaults:
 env:
   # nip.io / sslip.io: public wildcard DNS (169.254.169.254.nip.io -> 169.254.169.254), used to
   # prove allowlisted names that resolve to internal addresses are refused (review H1)
+  # Exact by default (v2.0.0-beta.5+): a bare name is that name only; *.x = subdomains; .x = both.
   ALLOWED: >-
     registry.npmjs.org pypi.org files.pythonhosted.org
-    docker.io docker.com
-    nip.io sslip.io
+    .docker.io .docker.com
+    *.nip.io *.sslip.io
   PASSTHROUGH: 100-64-0-1.sslip.io pt-hosts.sslip.io
   # service-container egress probe (v2test/probe.py, base64), run by the service's health-cmd
   PROBE: IyBTZXJ2aWNlLWNvbnRhaW5lciBlZ3Jlc3MgcHJvYmUgKHJ1biBieSB0aGUgc2VydmljZSdzIGhlYWx0aC1jbWQgZXZlcnkgZmV3IHNlY29uZHMpLgppbXBvcnQgc29ja2V0LCBzc2wsIHRpbWUsIHVybGxpYi5yZXF1ZXN0CmRlZiB0KG5hbWUsIGZuKToKICAgIHRyeToKICAgICAgICByID0gZm4oKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHIgPSAiRVJSICIgKyB0eXBlKGUpLl9fbmFtZV9fICsgIjogIiArIHN0cihlKVs6OTBdCiAgICBwcmludCh0aW1lLnN0cmZ0aW1lKCIlSDolTTolUyIpLCBuYW1lLCByLCBmbHVzaD1UcnVlKQp0KCJkbnMtZXhhbXBsZS5vcmciLCBsYW1iZGE6IHNvY2tldC5nZXRob3N0YnluYW1lKCJleGFtcGxlLm9yZyIpKQp0KCJodHRwcy1leGFtcGxlLm9yZyIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9leGFtcGxlLm9yZyIsIHRpbWVvdXQ9Nikuc3RhdHVzKQp0KCJodHRwLWV4YW1wbGUub3JnIiwgbGFtYmRhOiB1cmxsaWIucmVxdWVzdC51cmxvcGVuKCJodHRwOi8vZXhhbXBsZS5vcmciLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgiaHR0cHMtZ2l0aHViLmNvbSIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9naXRodWIuY29tL3JvYm90cy50eHQiLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgidGNwLTEuMS4xLjE6ODUzIiwgbGFtYmRhOiBzb2NrZXQuY3JlYXRlX2Nvbm5lY3Rpb24oKCIxLjEuMS4xIiwgODUzKSwgdGltZW91dD01KS5jbG9zZSgpIG9yICJjb25uZWN0ZWQiKQo=
@@ -47,7 +48,7 @@ jobs:
     steps:
       # Default enforce: since beta.2 this removes sudo (disable-sudo unset = on in enforce, H2)
       - name: safer-runner v2 (enforce, defaults)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.4
+        uses: portswigger-tim/safer-runner-action@90d20e7673362fbdbdc2c61ce84df6e166ad4df0
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -130,7 +131,7 @@ jobs:
     steps:
       # Explicit opt-out: sudo kept, job labelled "enforce (ADVISORY - sudo retained)" (H2)
       - name: safer-runner v2 (enforce, sudo retained)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.4
+        uses: portswigger-tim/safer-runner-action@90d20e7673362fbdbdc2c61ce84df6e166ad4df0
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -171,7 +172,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (analyze)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.4
+        uses: portswigger-tim/safer-runner-action@90d20e7673362fbdbdc2c61ce84df6e166ad4df0
         with:
           mode: analyze
       - uses: actions/checkout@v7
@@ -214,7 +215,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (enforce, strict privilege layer)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.4
+        uses: portswigger-tim/safer-runner-action@90d20e7673362fbdbdc2c61ce84df6e166ad4df0
         with:
           mode: enforce
           disable-sudo: true
@@ -261,7 +262,7 @@ jobs:
           --health-interval 5s --health-timeout 45s --health-retries 10000
     steps:
       - name: safer-runner v2 (enforce, sudo + docker kept)
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.4
+        uses: portswigger-tim/safer-runner-action@90d20e7673362fbdbdc2c61ce84df6e166ad4df0
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -326,7 +327,7 @@ jobs:
           -i --health-cmd "echo $PROBE | base64 -d | python3 >> /out/log 2>&1; true"
           --health-interval 5s --health-timeout 45s --health-retries 10000
     steps:
-      - uses: portswigger-tim/safer-runner-action@v2.0.0-beta.4
+      - uses: portswigger-tim/safer-runner-action@90d20e7673362fbdbdc2c61ce84df6e166ad4df0
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -358,7 +359,7 @@ jobs:
           -i --health-cmd "echo $PROBE | base64 -d | python3 >> /out/log 2>&1; true"
           --health-interval 5s --health-timeout 45s --health-retries 10000
     steps:
-      - uses: portswigger-tim/safer-runner-action@v2.0.0-beta.4
+      - uses: portswigger-tim/safer-runner-action@90d20e7673362fbdbdc2c61ce84df6e166ad4df0
         with:
           mode: analyze
       - uses: actions/checkout@v7
@@ -387,7 +388,7 @@ jobs:
       - name: safer-runner v2 in a job container
         id: sr
         continue-on-error: true
-        uses: portswigger-tim/safer-runner-action@v2.0.0-beta.4
+        uses: portswigger-tim/safer-runner-action@90d20e7673362fbdbdc2c61ce84df6e166ad4df0
         with:
           mode: ${{ matrix.mode }}
       - name: results

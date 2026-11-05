@@ -97,7 +97,7 @@ dns) # N1-N3
       echo allowed: \$(getent hosts github.com | head -1 || echo FAILED)" 2>&1)
     sleep 1; seen=$(dns_seen "$tag.example.org")
     grep -q 'denied: NXDOMAIN' <<<"$out" && [ "$seen" -gt 0 ]
-    pass_if "N.$net-filtered" $? "denied name NXDOMAIN and seen by our dnsmasq ($seen): $(tr '\n' ' ' <<<"$out")"
+    pass_if "N.$net-filtered" $? "denied name NXDOMAIN and seen by our resolver ($seen): $(tr '\n' ' ' <<<"$out")"
     grep -q 'allowed: [0-9]' <<<"$out"; pass_if "N.$net-allowed" $? "allowlisted name resolves ($net)"
   done
   tag="t$RANDOM$RANDOM"
@@ -107,7 +107,7 @@ q=struct.pack('>HHHHHH',random.randint(0,65535),0x0100,1,0,0,0)+b''.join(bytes([
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(5);s.sendto(q,('8.8.8.8',53))
 d,a=s.recvfrom(512);print('rcode',d[3]&15,'from',a)" 2>&1 | tail -1)
   sleep 1; seen=$(dns_seen "$tag.tunnel")
-  [ "$seen" -gt 0 ]; pass_if N3.direct-8.8.8.8 $? "raw DNS to 8.8.8.8 from a container answered by our dnsmasq ($seen): $out"
+  [ "$seen" -gt 0 ]; pass_if N3.direct-8.8.8.8 $? "raw DNS to 8.8.8.8 from a container answered by our resolver ($seen): $out"
   ;;
 
 posture) # container-tls sni-only (default): no CA in any image; host still intercepted

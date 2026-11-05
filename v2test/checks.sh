@@ -9,7 +9,7 @@ must_pass() {
   local code issuer out
   record ctx.os INFO "$(. /etc/os-release; echo "$PRETTY_NAME") $(uname -r); $(sudo --version 2>/dev/null | head -1)"
   out=$(jq -c . /var/log/safer-runner/selftest.json 2>&1)
-  jq -e 'length == 2 and all(.ok)' /var/log/safer-runner/selftest.json >/dev/null 2>&1
+  jq -e 'length == 3 and all(.ok) and any(.name == "dns-exact")' /var/log/safer-runner/selftest.json >/dev/null 2>&1
   pass_if S.action-selftests $? "$out"
 
   for v in NODE_EXTRA_CA_CERTS NODE_USE_SYSTEM_CA REQUESTS_CA_BUNDLE PIP_CERT SSL_CERT_FILE GIT_SSL_CAINFO AWS_CA_BUNDLE CURL_CA_BUNDLE; do
@@ -50,6 +50,12 @@ J
   pass_if A.java $? "java ($JAVA_HOME): $(tail -1 <<<"$out")"
 
   out=$(timeout 120 docker pull -q alpine:3.20 2>&1); record A.docker-pull INFO "rc=$? $(tail -1 <<<"$out" | cut -c1-160)"
+  # ghcr: registry API on ghcr.io (exact) + blobs 307'd to pkg-containers.githubusercontent.com (exact): no *.ghcr.io
+  out=$(timeout 120 docker pull -q ghcr.io/containerd/busybox:1.36 2>&1); rc=$?
+  if docker info >/dev/null 2>&1; then pass_if A.ghcr-pull $rc "docker pull ghcr.io/containerd/busybox:1.36 -> $(tail -1 <<<"$out" | cut -c1-160)"
+  else record A.ghcr-pull INFO "no docker access in this job: $(tail -1 <<<"$out" | cut -c1-120)"; fi
+
+  dns_resolver
 
   # ~300 MiB of a GitHub release asset through the MITM (single stream, informational)
   out=$(curl -sS -L -m 120 -r 0-314572799 -o /dev/null -w '%{size_download} %{time_total}' \
@@ -105,15 +111,68 @@ must_fail() {
   for r in 168.63.129.16 8.8.8.8 127.0.0.53; do
     out=$(dig +short +time=3 +tries=1 "@$r" example.org A 2>&1)
     if grep -qE '^[0-9]+\.' <<<"$out"; then record "DNS.direct-$r" FAIL "dig @$r example.org -> $out"; else
-      record "DNS.direct-$r" PASS "dig @$r example.org -> '${out:-<no answer>}' (answered by our dnsmasq)"; fi
+      record "DNS.direct-$r" PASS "dig @$r example.org -> '${out:-<no answer>}' (answered by our resolver)"; fi
   done
   out=$(dig +short +time=3 +tries=1 @168.63.129.16 api.github.com A 2>&1)
   record DNS.allowed-via-azure INFO "dig @168.63.129.16 api.github.com -> $(tr '\n' ' ' <<<"$out")"
-  grep -q 'query\[A\] example.org' /var/log/safer-runner/dns.log
-  pass_if DNS.redirected-to-dnsmasq $? "dnsmasq logged the direct-IP queries for example.org"
+  grep -q ' BLOCK A example.org. ' /var/log/safer-runner/dns.log
+  pass_if DNS.redirected-to-resolver $? "CoreDNS logged (BLOCK) the direct-IP queries for example.org"
+
+  dns_exact
 
   rec=$(jq -c 'select(.ev=="tls" and .layer=="sni" and .verdict=="BLOCK")' "$FLOWLOG" | wc -l)
   [ "$rec" -gt 0 ]; pass_if S.sni-layer-block-fired $? "$rec SNI-layer BLOCK records (enforcement happened at the ClientHello, not only Host)"
+}
+
+# CoreDNS resolver on the real runner (the spike's NOT-VERIFIED items: non-root :53 bind via an
+# ambient capability under systemd-run, StandardOutput=append log file + mode, coexistence with
+# GitHub's 127.0.0.100 egress resolver, amd64)
+dns_resolver() {
+  local pid out caps
+  record ctx.arch INFO "$(uname -m); listeners on :53: $(ss -Hlun 'sport = :53' | awk '{print $4}' | sort -u | tr '\n' ' ')"
+  systemctl is-active -q safer-runner-dns; pass_if R.unit-active $? "safer-runner-dns: $(systemctl is-active safer-runner-dns) restarts=$(systemctl show -p NRestarts --value safer-runner-dns)"
+  pid=$(systemctl show -p MainPID --value safer-runner-dns)
+  out=$(ps -o user:32=,uid=,comm= -p "$pid" 2>&1)
+  caps=$(awk '/^Cap(Eff|Prm|Bnd|Amb)/{printf "%s=%s ", $1, $2}' "/proc/$pid/status" 2>&1)
+  [[ "$out" =~ ^dns-[0-9a-f]+\ +6[0-9]{4}\ +coredns$ ]] && grep -q 'CapEff:=0000000000000400' <<<"$caps"
+  pass_if R.non-root-cap-bind $? "pid $pid: $out; $caps"
+  ss -Hlun 'sport = :53' | grep -q '127.0.0.1:53'; pass_if R.bound-127.0.0.1 $? "$(ss -Hlun 'sport = :53' | awk '{print $4}' | tr '\n' ' ')"
+  out=$(stat -c '%U:%G %a' /var/log/safer-runner/dns.log 2>&1)
+  [ "$out" = "root:root 644" ] && grep -q ' ALLOW A github.com. ' /var/log/safer-runner/dns.log
+  pass_if R.log-file $? "dns.log $out, readable without sudo; $(grep -m1 -o 'CoreDNS-[0-9.]*' /var/log/safer-runner/dns.log) $(grep -m1 -o 'linux/[a-z0-9]*' /var/log/safer-runner/dns.log)"
+  grep -q '^nameserver 127.0.0.1$' /etc/resolv.conf; pass_if R.resolv-conf $? "$(grep nameserver /etc/resolv.conf | tr '\n' ' ')"
+  if ss -Hlun 'sport = :53' | grep -q '127.0.0.100:53'; then
+    out=$(getent hosts github.com | head -1); [ -n "$out" ]
+    pass_if R.coexists-127.0.0.100 $? "GitHub egress resolver present on 127.0.0.100:53 alongside ours; github.com -> $out"
+  else
+    record R.coexists-127.0.0.100 INFO "no 127.0.0.100 resolver on this VM"
+  fi
+  # wildcard entries resolve (.docker.io expands to docker.io + *.docker.io; meta's *.actions...)
+  for n in registry-1.docker.io pipelines.actions.githubusercontent.com hosted-compute-watchdog-prod-iad-01.githubapp.com 1.1.1.1.nip.io docker.io; do
+    out=$(getent ahostsv4 "$n" | awk '{print $1; exit}')
+    [ -n "$out" ]; pass_if "R.wildcard-$n" $? "$n -> ${out:-<none>}"
+  done
+}
+
+# exact-FQDN: a name under an exact entry is refused ON THE RUNNER (BLOCK block, never the ALLOW/
+# forwarding block), for every query type and transport; the name never gets an upstream= line.
+dns_exact() {
+  local secret parent n out st
+  secret="s$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  for parent in objects.githubusercontent.com pypi.org release-assets.githubusercontent.com; do
+    n="$secret.$parent"
+    for q in "A" "TXT" "AAAA +tcp"; do
+      st=$(dig +time=3 +tries=1 $n $q 2>&1 | grep -o 'status: [A-Z]*')
+      [ "$st" = "status: NXDOMAIN" ]; pass_if "X.exact-$parent-${q// /}" $? "dig $n $q -> $st"
+    done
+    sleep 0.5
+    grep -q " BLOCK A $n. NXDOMAIN" /var/log/safer-runner/dns.log && ! grep -q "$n. .*upstream=" /var/log/safer-runner/dns.log
+    pass_if "X.exact-$parent-not-forwarded" $? "$(grep -c "$n" /var/log/safer-runner/dns.log) BLOCK lines, $(grep -c "$n. .*upstream=" /var/log/safer-runner/dns.log) forwarded"
+  done
+  out=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' https://www.pypi.org/ 2>&1); local rc=$?
+  [ $rc -ne 0 ]; pass_if X.exact-user-entry-subdomain $? "https://www.pypi.org (only pypi.org listed) -> rc=$rc '${out: -60}'"
+  out=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' https://pypi.org/simple/ 2>&1)
+  [[ "$out" =~ ^[23] ]]; pass_if X.exact-user-entry-apex $? "https://pypi.org/simple/ -> $out"
 }
 
 # Needs sudo: only meaningful in the advisory job (enforce + disable-sudo: false).
@@ -128,9 +187,8 @@ sudo_must_fail() {
   [ $rc -ne 0 ] && [ -z "$rec" ]
   pass_if B.fail-closed-hole $? "REDIRECT bypassed for $ATTACKER_IP (proxy never saw it) -> rc=$rc '${out: -80}'"
 
-  # H1, addon layer alone: /etc/hosts makes the PROXY resolve allowlisted names to internal
-  # addresses without dnsmasq (whose stop-dns-rebind would otherwise refuse them first). The
-  # client dials a public IP, so the only thing that can refuse is the proxy's IP guard.
+  # H1, addon layer via /etc/hosts (also covers ULA, which public wildcard DNS can't give us).
+  # The client dials a public IP, so the only thing that can refuse is the proxy's IP guard.
   printf '169.254.169.254 imds-hosts.nip.io\n127.0.0.1 lo-hosts.nip.io\n10.0.0.1 rfc1918-hosts.nip.io\nfd00::1 ula-hosts.nip.io\n169.254.169.254 pt-hosts.sslip.io\n' | sudo tee -a /etc/hosts >/dev/null
   local n ip
   for pair in imds-hosts:169.254.169.254 lo-hosts:127.0.0.1 rfc1918-hosts:10.0.0.1; do
@@ -158,44 +216,62 @@ sudo_must_fail() {
     sleep 0.5
   done
   record X.proxy-kill-recovery INFO "SIGKILL -> api.github.com $code after $(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')s; restarts=$(systemctl show -p NRestarts --value safer-runner-proxy)"
+
+  # exact-FQDN on the wire: a name under an exact entry never leaves the VM; a name under a
+  # wildcard entry does (the control proves the capture works - wildcards stay a DNS channel)
+  local secret ctl pcap=/tmp/dns-wire.pcap
+  secret="w$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')"; ctl="c$RANDOM$RANDOM.github.com"
+  sudo timeout 12 tcpdump -i any -nn -U -s 0 -w "$pcap" 'port 53 and not net 127.0.0.0/8' 2>/dev/null &
+  sleep 2
+  dig +time=2 +tries=1 "$secret.objects.githubusercontent.com" A >/dev/null 2>&1
+  dig +time=2 +tries=1 +tcp "$secret.pypi.org" TXT >/dev/null 2>&1
+  dig +time=2 +tries=1 "$ctl" A >/dev/null 2>&1
+  wait
+  out=$(sudo tcpdump -nn -r "$pcap" 2>/dev/null)
+  ! grep -q "$secret" <<<"$out" && grep -q "${ctl%%.*}" <<<"$out"
+  pass_if X.exact-not-on-wire $? "pcap ($(wc -l <<<"$out") pkts off-host :53): secret seen $(grep -c "$secret" <<<"$out")x, wildcard control seen $(grep -c "${ctl%%.*}" <<<"$out")x"
+
+  # resolver crash: systemd restarts it and resolution recovers
+  sudo systemctl kill -s KILL safer-runner-dns
+  t0=$(date +%s.%N); out=""
+  for _ in $(seq 1 30); do
+    out=$(dig +short +time=1 +tries=1 github.com A | head -1); [ -n "$out" ] && break
+    sleep 0.5
+  done
+  [ -n "$out" ]
+  pass_if X.dns-kill-recovery $? "SIGKILL CoreDNS -> github.com $out after $(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')s; restarts=$(systemctl show -p NRestarts --value safer-runner-dns)"
 }
 
 # H1: allowlisted names (nip.io / sslip.io are allowlisted in these jobs) that resolve to
 # internal addresses must never be reached through the proxy.
 ssrf() {
   local out n
-  # dnsmasq layer: stop-dns-rebind drops private answers; public answers under the same suffix still resolve
-  for n in 169.254.169.254.nip.io 127.0.0.1.nip.io 10.0.0.1.nip.io 192.168.1.1.nip.io; do
+  # No DNS-layer rebind drop any more (CoreDNS replaced dnsmasq): internal answers are returned
+  # as-is and the PROXY's upstream IP guard refuses them, logging the address.
+  for n in 169.254.169.254.nip.io 127.0.0.1.nip.io 10.0.0.1.nip.io 100.64.0.1.nip.io; do
     out=$(dig +short +time=3 +tries=2 @127.0.0.1 "$n" A 2>&1)
-    if grep -qE '^[0-9]+\.' <<<"$out"; then record "H1.dns-rebind-$n" FAIL "dig $n -> $out"; else
-      record "H1.dns-rebind-$n" PASS "dig $n -> '${out:-<no answer>}' (rebind answer dropped)"; fi
+    record "H1.dns-answer-$n" INFO "dig $n -> '${out:-<no answer>}' (no DNS-layer rebind drop, by design)"
   done
-  grep -q 'DNS-rebind' /var/log/safer-runner/dns.log
-  pass_if H1.dns-rebind-logged $? "dnsmasq logged: $(grep -m1 'DNS-rebind' /var/log/safer-runner/dns.log | cut -c1-160)"
   out=$(dig +short +time=3 +tries=2 @127.0.0.1 1.1.1.1.nip.io A 2>&1)
   [ "$out" = 1.1.1.1 ]; pass_if H1.dns-public-still-resolves $? "dig 1.1.1.1.nip.io -> $out"
 
-  # end to end: IMDS by an allowlisted name (no --resolve) must not answer
+  # IMDS by an allowlisted name, dialled directly: 169.254.169.254:80 is exempt from the REDIRECT
+  # (the platform needs it), so this reaches IMDS exactly like the IP literal does. Informational.
   out=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H 'Metadata: true' 'http://169.254.169.254.nip.io/metadata/instance?api-version=2021-02-01' 2>&1); local rc=$?
-  { [ $rc -ne 0 ] || [ "${out: -3}" != 200 ]; }
-  pass_if H1.imds-by-name $? "http://169.254.169.254.nip.io/metadata/instance -> rc=$rc '${out: -80}'"
+  record H1.imds-by-name INFO "http://169.254.169.254.nip.io/metadata/instance -> rc=$rc '${out: -60}' (same reachability as http://169.254.169.254/, by design)"
 
-  # through the proxy, dnsmasq refuses: the proxy's lookup fails -> upstream-unresolved
+  # through the proxy: the IP guard refuses and logs the internal address it resolved
   expect_upstream_refused H1.proxy-imds-http "Host 169.254.169.254.nip.io dialled at $ATTACKER_IP (plain HTTP)" 169.254.169.254 \
-    '.ev=="upstream" and .host=="169.254.169.254.nip.io" and .verdict=="BLOCK"' \
+    '.ev=="upstream" and .host=="169.254.169.254.nip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden" and ((.resolved // []) | tostring | contains("169.254.169.254"))' \
     curl -sS -m 10 -o /dev/null -w '%{http_code}' -H 'Metadata: true' --resolve "169.254.169.254.nip.io:80:$ATTACKER_IP" 'http://169.254.169.254.nip.io/metadata/instance?api-version=2021-02-01'
   expect_upstream_refused H1.proxy-loopback-https "SNI 127.0.0.1.nip.io dialled at $ATTACKER_IP (intercept)" 127.0.0.1 \
-    '.ev=="upstream" and .host=="127.0.0.1.nip.io" and .verdict=="BLOCK"' \
+    '.ev=="upstream" and .host=="127.0.0.1.nip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden" and ((.resolved // []) | tostring | contains("127.0.0.1"))' \
     curl -k -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "127.0.0.1.nip.io:443:$ATTACKER_IP" https://127.0.0.1.nip.io/
   expect_upstream_refused H1.proxy-rfc1918-http "Host 10.0.0.1.nip.io dialled at $ATTACKER_IP" 10.0.0.1 \
-    '.ev=="upstream" and .host=="10.0.0.1.nip.io" and .verdict=="BLOCK"' \
+    '.ev=="upstream" and .host=="10.0.0.1.nip.io" and .verdict=="BLOCK" and .reason=="upstream-ip-forbidden" and ((.resolved // []) | tostring | contains("10.0.0.1"))' \
     curl -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "10.0.0.1.nip.io:80:$ATTACKER_IP" http://10.0.0.1.nip.io/
 
-  # CGNAT: dnsmasq 2.91 (24.04) passes 100.64/10 answers, 2.92 (26.04) drops them too. The client
-  # dials a public IP (--resolve), so whichever layer refuses, the proxy must log a BLOCK and
-  # never connect to 100.64.0.1 (reason upstream-ip-forbidden on 2.91, upstream-unresolved on 2.92).
-  out=$(dig +short +time=3 +tries=2 @127.0.0.1 100.64.0.1.nip.io A 2>&1)
-  record H1.dns-cgnat INFO "dig 100.64.0.1.nip.io -> '${out:-<dropped by dnsmasq>}' ($(grep -m1 -o 'started, version [0-9.]*' /var/log/safer-runner/dns.log))"
+  # CGNAT (dnsmasq 2.91 used to pass it, 2.92 dropped it): now always the proxy's IP guard
   expect_upstream_refused H1.guard-cgnat-http "Host 100.64.0.1.nip.io dialled at $ATTACKER_IP (plain HTTP)" 100.64.0.1 \
     '.ev=="upstream" and .host=="100.64.0.1.nip.io" and .verdict=="BLOCK"' \
     curl -sS -m 10 -o /dev/null -w '%{http_code}' --resolve "100.64.0.1.nip.io:80:$ATTACKER_IP" http://100.64.0.1.nip.io/
@@ -264,8 +340,11 @@ analyze() {
   sleep 0.5; rec=$(flows_q "$m" '.ev=="https" and .reason=="host-sni-mismatch" and .verdict=="WOULD_BLOCK"' | head -1)
   [ -n "$rec" ]; pass_if Z.fronting-logged $? "fronting in analyze -> $out, logged: $rec"
   out=$(dig +short +time=3 +tries=1 @8.8.8.8 example.org A 2>&1)
-  grep -q 'query\[A\] example.org' /var/log/safer-runner/dns.log
-  pass_if Z.dns-redirected $? "dig @8.8.8.8 answered via dnsmasq: $(tr '\n' ' ' <<<"$out")"
+  grep -q ' WOULD_BLOCK A example.org. ' /var/log/safer-runner/dns.log
+  pass_if Z.dns-redirected $? "dig @8.8.8.8 answered via CoreDNS, labelled WOULD_BLOCK: $(tr '\n' ' ' <<<"$out")"
+  out=$(dig +short +time=3 +tries=1 "srst$RANDOM.objects.githubusercontent.com" A 2>&1)
+  grep -q ' WOULD_BLOCK A srst[0-9]*.objects.githubusercontent.com. ' /var/log/safer-runner/dns.log
+  pass_if Z.dns-exact-would-block $? "subdomain of an exact entry is labelled WOULD_BLOCK in analyze (still forwarded)"
   # H1 in analyze: the upstream IP guard logs WOULD_BLOCK (monitoring only), it does not refuse
   m=$(mark)
   out=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' http://100.64.0.1.nip.io/ 2>&1)
