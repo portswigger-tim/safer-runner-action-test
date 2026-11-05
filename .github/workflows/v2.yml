@@ -48,7 +48,7 @@ jobs:
     steps:
       # Default enforce: since beta.2 this removes sudo (disable-sudo unset = on in enforce, H2)
       - name: safer-runner v2 (enforce, defaults)
-        uses: portswigger-tim/safer-runner-action@89ed8e6ba29cc60c3a728b56829694757370de0c
+        uses: portswigger-tim/safer-runner-action@a918a6718a4289e70b37f28a4d5801346d9e5632
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -131,7 +131,7 @@ jobs:
     steps:
       # Explicit opt-out: sudo kept, job labelled "enforce (ADVISORY - sudo retained)" (H2)
       - name: safer-runner v2 (enforce, sudo retained)
-        uses: portswigger-tim/safer-runner-action@89ed8e6ba29cc60c3a728b56829694757370de0c
+        uses: portswigger-tim/safer-runner-action@a918a6718a4289e70b37f28a4d5801346d9e5632
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -172,7 +172,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (analyze)
-        uses: portswigger-tim/safer-runner-action@89ed8e6ba29cc60c3a728b56829694757370de0c
+        uses: portswigger-tim/safer-runner-action@a918a6718a4289e70b37f28a4d5801346d9e5632
         with:
           mode: analyze
       - uses: actions/checkout@v7
@@ -215,7 +215,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
     steps:
       - name: safer-runner v2 (enforce, strict privilege layer)
-        uses: portswigger-tim/safer-runner-action@89ed8e6ba29cc60c3a728b56829694757370de0c
+        uses: portswigger-tim/safer-runner-action@a918a6718a4289e70b37f28a4d5801346d9e5632
         with:
           mode: enforce
           disable-sudo: true
@@ -262,7 +262,7 @@ jobs:
           --health-interval 5s --health-timeout 45s --health-retries 10000
     steps:
       - name: safer-runner v2 (enforce, sudo + docker kept)
-        uses: portswigger-tim/safer-runner-action@89ed8e6ba29cc60c3a728b56829694757370de0c
+        uses: portswigger-tim/safer-runner-action@a918a6718a4289e70b37f28a4d5801346d9e5632
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -327,7 +327,7 @@ jobs:
           -i --health-cmd "echo $PROBE | base64 -d | python3 >> /out/log 2>&1; true"
           --health-interval 5s --health-timeout 45s --health-retries 10000
     steps:
-      - uses: portswigger-tim/safer-runner-action@89ed8e6ba29cc60c3a728b56829694757370de0c
+      - uses: portswigger-tim/safer-runner-action@a918a6718a4289e70b37f28a4d5801346d9e5632
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -359,7 +359,7 @@ jobs:
           -i --health-cmd "echo $PROBE | base64 -d | python3 >> /out/log 2>&1; true"
           --health-interval 5s --health-timeout 45s --health-retries 10000
     steps:
-      - uses: portswigger-tim/safer-runner-action@89ed8e6ba29cc60c3a728b56829694757370de0c
+      - uses: portswigger-tim/safer-runner-action@a918a6718a4289e70b37f28a4d5801346d9e5632
         with:
           mode: analyze
       - uses: actions/checkout@v7
@@ -388,7 +388,7 @@ jobs:
       - name: safer-runner v2 in a job container
         id: sr
         continue-on-error: true
-        uses: portswigger-tim/safer-runner-action@89ed8e6ba29cc60c3a728b56829694757370de0c
+        uses: portswigger-tim/safer-runner-action@a918a6718a4289e70b37f28a4d5801346d9e5632
         with:
           mode: ${{ matrix.mode }}
       - name: results

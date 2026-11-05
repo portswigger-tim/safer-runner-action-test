@@ -140,6 +140,10 @@ dns_resolver() {
   out=$(stat -c '%U:%G %a' /var/log/safer-runner/dns.log 2>&1)
   [ "$out" = "root:root 644" ] && grep -q ' ALLOW A github.com. ' /var/log/safer-runner/dns.log
   pass_if R.log-file $? "dns.log $out, readable without sudo; $(grep -m1 -o 'CoreDNS-[0-9.]*' /var/log/safer-runner/dns.log) $(grep -m1 -o 'linux/[a-z0-9]*' /var/log/safer-runner/dns.log)"
+  # /etc/hosts names over DNS (hosts plugin), incl. the VM hostname even when /etc/hosts lacks it (AWS)
+  out=$(dig +short +time=2 +tries=1 @127.0.0.1 "$(hostname)" A | head -1); local lh; lh=$(dig +short +time=2 +tries=1 @127.0.0.1 localhost A | head -1)
+  [[ "$out" =~ ^[0-9.]+$ ]] && [ "$lh" = 127.0.0.1 ] && ! sudo -n true 2>&1 | grep -q 'unable to resolve host'
+  pass_if R.local-names $? "dig $(hostname) -> ${out:-<none>}; localhost -> ${lh:-<none>}; in /etc/hosts: $(grep -cw "$(hostname)" /etc/hosts)"
   grep -q '^nameserver 127.0.0.1$' /etc/resolv.conf; pass_if R.resolv-conf $? "$(grep nameserver /etc/resolv.conf | tr '\n' ' ')"
   if ss -Hlun 'sport = :53' | grep -q '127.0.0.100:53'; then
     out=$(getent hosts github.com | head -1); [ -n "$out" ]
