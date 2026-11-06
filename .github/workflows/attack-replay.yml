@@ -41,7 +41,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: safer-runner (enforce, defaults)
-        uses: portswigger-tim/safer-runner-action@aefab7ba88ea70af992c0fa528c577ae846a5594 # http-filter branch
+        uses: portswigger-tim/safer-runner-action@v2.2.0
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
