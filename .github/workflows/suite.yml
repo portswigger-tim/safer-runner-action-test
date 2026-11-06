@@ -12,11 +12,14 @@ on:
         required: true
         type: string
       only:
-        description: 'Run only this job (enforce|advisory|analyze|strict|crash|containers), or all'
+        description: 'Run only this job (enforce|advisory|analyze|strict|crash|containers|http-filter), or all'
         required: false
         type: string
         default: 'all'
 
+# The caller grants contents: write + id-token: write for the http-filter jobs only (a real
+# git push the filter must refuse; an OIDC token the platform list must allow). Everything else
+# runs read-only.
 permissions:
   contents: read
   actions: read
@@ -46,7 +49,7 @@ jobs:
     steps:
       # Default enforce removes sudo (disable-sudo unset = on in enforce, H2)
       - name: safer-runner (enforce, defaults)
-        uses: portswigger-tim/safer-runner-action@main
+        uses: portswigger-tim/safer-runner-action@v2.2.0
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -125,7 +128,7 @@ jobs:
     steps:
       # Explicit opt-out: sudo kept, job labelled "enforce (ADVISORY - sudo retained)" (H2)
       - name: safer-runner (enforce, sudo retained)
-        uses: portswigger-tim/safer-runner-action@main
+        uses: portswigger-tim/safer-runner-action@v2.2.0
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -162,7 +165,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: safer-runner (analyze)
-        uses: portswigger-tim/safer-runner-action@main
+        uses: portswigger-tim/safer-runner-action@v2.2.0
         with:
           mode: analyze
       - uses: actions/checkout@v7
@@ -201,7 +204,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: safer-runner (enforce, strict privilege layer)
-        uses: portswigger-tim/safer-runner-action@main
+        uses: portswigger-tim/safer-runner-action@v2.2.0
         with:
           mode: enforce
           disable-sudo: true
@@ -234,7 +237,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: safer-runner (enforce, sudo retained so the checks can kill the units)
-        uses: portswigger-tim/safer-runner-action@main
+        uses: portswigger-tim/safer-runner-action@v2.2.0
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -281,7 +284,7 @@ jobs:
           --health-interval 5s --health-timeout 45s --health-retries 10000
     steps:
       - name: safer-runner (enforce, sudo + docker kept)
-        uses: portswigger-tim/safer-runner-action@main
+        uses: portswigger-tim/safer-runner-action@v2.2.0
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -334,7 +337,7 @@ jobs:
     timeout-minutes: 20
     services: *probe-service
     steps:
-      - uses: portswigger-tim/safer-runner-action@main
+      - uses: portswigger-tim/safer-runner-action@v2.2.0
         with:
           mode: enforce
           allowed-domains: ${{ env.ALLOWED }}
@@ -353,7 +356,7 @@ jobs:
     timeout-minutes: 20
     services: *probe-service
     steps:
-      - uses: portswigger-tim/safer-runner-action@main
+      - uses: portswigger-tim/safer-runner-action@v2.2.0
         with:
           mode: analyze
       - uses: actions/checkout@v7
@@ -366,3 +369,213 @@ jobs:
       - name: results
         if: always()
         run: source tests/lib.sh && finish "containers-analyze / ${{ inputs.os }}"
+
+  # http-filter: method + path filtering on allowed hosts. Real push with the job token
+  # (contents: write) so git reaches the git-receive-pack POST the filter must refuse.
+  http-filter:
+    if: ${{ inputs.only == 'all' || inputs.only == 'http-filter' }}
+    name: http-filter (enforce)
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GIT_TERMINAL_PROMPT: '0'
+    steps:
+      - name: safer-runner (enforce, http-filter)
+        uses: portswigger-tim/safer-runner-action@v2.2.0
+        with:
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
+          http-filter: |
+            api.github.com:     { "*": GET, HEAD }
+            registry.npmjs.org: { "*": GET, HEAD }
+            github.com:
+              "*": "*"
+              "*/git-receive-pack": NONE
+              "portswigger-tim/srt-carveout/git-receive-pack": "*"
+              "octocat/spoon-knife/*": NONE
+      - uses: actions/checkout@v7
+      - name: API read-only, git push refused (with and without .git), npm read-only, report
+        run: tests/checks.sh http-filter || true
+      - name: results
+        if: always()
+        run: source tests/lib.sh && finish "http-filter / ${{ inputs.os }}"
+      - name: evidence
+        if: always()
+        run: |
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          cp "$RUNNER_TEMP"/safer-runner-report.* evidence/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-http-filter-${{ inputs.os }}
+          path: evidence/
+          retention-days: 7
+
+  # The built-in platform allowlist: the platform hosts are filtered hard, so step logs,
+  # artifacts, cache and OIDC only work through its explicit (host, path, method) entries.
+  http-filter-platform:
+    if: ${{ inputs.only == 'all' || inputs.only == 'http-filter' }}
+    name: http-filter platform allowlist (enforce)
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - name: safer-runner (enforce, platform hosts filtered)
+        uses: portswigger-tim/safer-runner-action@v2.2.0
+        with:
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
+          http-filter: |
+            results-receiver.actions.githubusercontent.com:      { "*": NONE }
+            productionresultssa*.blob.core.windows.net:          { "*": NONE }
+            run-actions-*-azure-*.actions.githubusercontent.com: { "*": NONE }
+      - uses: actions/checkout@v7
+      - name: OIDC + the filter is live on each platform host
+        run: tests/checks.sh http-filter-platform || true
+      - name: outlive a job-lease renewal (the runner renews about once a minute)
+        run: sleep 75
+      - name: prepare artifact / cache payload
+        run: |
+          mkdir -p art cache-dir
+          head -c 5000000 /dev/urandom > art/payload.bin
+          sha256sum art/payload.bin | cut -d' ' -f1 > art.sha256
+          cp art/payload.bin cache-dir/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: http-filter-platform-${{ inputs.os }}
+          path: art/payload.bin
+          retention-days: 1
+      - uses: actions/download-artifact@v8
+        with:
+          name: http-filter-platform-${{ inputs.os }}
+          path: dl
+      - uses: actions/cache/save@v6
+        with:
+          path: cache-dir
+          key: suite-${{ github.run_id }}-${{ github.run_attempt }}-http-filter-platform-${{ inputs.os }}
+      - name: wait for cache consistency
+        run: sleep 10
+      - uses: actions/cache/restore@v6
+        id: restore
+        with:
+          path: cache-dir
+          key: suite-${{ github.run_id }}-${{ github.run_attempt }}-http-filter-platform-${{ inputs.os }}
+          fail-on-cache-miss: true
+      - name: platform requests all allowed, report
+        if: always()
+        run: tests/checks.sh http-filter-platform-audit || true
+      - name: results
+        if: always()
+        run: |
+          source tests/lib.sh
+          [ "$(sha256sum dl/payload.bin | cut -d' ' -f1)" = "$(cat art.sha256)" ]
+          pass_if HP.artifact-roundtrip $? "upload-artifact -> download-artifact sha256"
+          [ "${{ steps.restore.outcome }}" = success ]; pass_if HP.cache-roundtrip $? "cache save -> restore: ${{ steps.restore.outcome }}"
+          finish "http-filter-platform / ${{ inputs.os }}"
+      - name: evidence
+        if: always()
+        run: |
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          cp "$RUNNER_TEMP"/safer-runner-report.* evidence/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-http-filter-platform-${{ inputs.os }}
+          path: evidence/
+          retention-days: 7
+
+  # allow-github-platform: false turns the built-in list off: the same kind of filter now
+  # refuses the cache upload.
+  http-filter-no-platform:
+    if: ${{ inputs.only == 'all' || inputs.only == 'http-filter' }}
+    name: http-filter allow-github-platform:false (enforce)
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 20
+    steps:
+      - name: safer-runner (enforce, platform list off)
+        uses: portswigger-tim/safer-runner-action@v2.2.0
+        with:
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          allow-github-platform: false
+          http-filter: |
+            productionresultssa*.blob.core.windows.net:
+              "*": "*"
+              "actions-cache/*": NONE
+      - uses: actions/checkout@v7
+      - name: platform list off
+        run: tests/checks.sh http-filter-no-platform || true
+      - run: mkdir -p cache-dir && head -c 1000000 /dev/urandom > cache-dir/payload.bin
+      - uses: actions/cache/save@v6
+        with:
+          path: cache-dir
+          key: suite-${{ github.run_id }}-${{ github.run_attempt }}-http-filter-no-platform-${{ inputs.os }}
+      - name: wait for cache consistency
+        run: sleep 10
+      - uses: actions/cache/restore@v6
+        id: restore
+        continue-on-error: true
+        with:
+          path: cache-dir
+          key: suite-${{ github.run_id }}-${{ github.run_attempt }}-http-filter-no-platform-${{ inputs.os }}
+          fail-on-cache-miss: true
+      - name: cache upload refused
+        if: always()
+        run: tests/checks.sh http-filter-no-platform-audit || true
+      - name: results
+        if: always()
+        run: |
+          source tests/lib.sh
+          [ "${{ steps.restore.outcome }}" = failure ]; pass_if HN.cache-miss $? "cache restore after a refused upload: ${{ steps.restore.outcome }} (want failure)"
+          finish "http-filter-no-platform / ${{ inputs.os }}"
+      - name: evidence
+        if: always()
+        run: mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-http-filter-no-platform-${{ inputs.os }}
+          path: evidence/
+          retention-days: 7
+
+  # analyze: the filter only logs WOULD_BLOCK, and the report suggests an http-filter.
+  http-filter-analyze:
+    if: ${{ inputs.only == 'all' || inputs.only == 'http-filter' }}
+    name: http-filter (analyze)
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 20
+    steps:
+      - name: safer-runner (analyze, http-filter)
+        uses: portswigger-tim/safer-runner-action@v2.2.0
+        with:
+          mode: analyze
+          http-filter: |
+            api.github.com: { "*": GET, HEAD }
+            github.com:
+              "*": "*"
+              "*/git-receive-pack": NONE
+      - uses: actions/checkout@v7
+      - name: WOULD_BLOCK + report
+        run: tests/checks.sh http-filter-analyze || true
+      - name: results
+        if: always()
+        run: source tests/lib.sh && finish "http-filter-analyze / ${{ inputs.os }}"
+      - name: evidence
+        if: always()
+        run: |
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          cp "$RUNNER_TEMP"/safer-runner-report.* evidence/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-http-filter-analyze-${{ inputs.os }}
+          path: evidence/
+          retention-days: 7

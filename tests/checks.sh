@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # safer-runner real-runner checks.
-# usage: checks.sh <must-pass|must-fail|sudo-must-fail|ssrf|analyze|strict|privilege-removed|privilege-retained|crash-recovery|supply-chain|baseline>
+# usage: checks.sh <must-pass|must-fail|sudo-must-fail|ssrf|analyze|strict|privilege-removed|privilege-retained|crash-recovery|supply-chain|baseline|http-filter[-platform[-audit]|-no-platform[-audit]|-analyze]>
 set -u
 cd "$(dirname "$0")/.."
 source tests/lib.sh
@@ -517,6 +517,178 @@ JSON
   # Aggregate: across every replay above, the proxy never opened a server connection to the attacker IP.
   rc=$(jq -c "select(.ev==\"server-connect\" and (.peername // \"\" | startswith(\"$ATTACKER_IP:\")))" "$FLOWLOG" 2>/dev/null | wc -l)
   [ "$rc" -eq 0 ]; pass_if SC.no-egress-to-sink $? "$rc proxy server-connects to $ATTACKER_IP across all replays (want 0)"
+}
+
+# ---------------------------------------------------------------- http-filter
+# Method + path filtering on hosts that are already allowed (docs/DESIGN-L7-path-method.md in
+# the action). Flow records of a filtered host carry .filter (allow|platform|block) and
+# .filter_rule; a refusal has reason method-not-allowed or path-not-allowed.
+
+# enforce job: http-filter (see suite.yml) =
+#   api.github.com     { "*": GET, HEAD }
+#   registry.npmjs.org { "*": GET, HEAD }
+#   github.com         { "*": "*", "*/git-receive-pack": NONE, "portswigger-tim/srt-carveout/git-receive-pack": "*",
+#                        "octocat/spoon-knife/*": NONE }
+http_filter() {
+  local out rc rec m form url br code p d
+  rec=$(jq -c 'select(.ev=="start")' "$FLOWLOG" | tail -1)
+  jq -e '.http_filter_hosts == 3 and .platform_auto_allowed == 0' <<<"$rec" >/dev/null
+  pass_if HF.policy-loaded $? "proxy start record: $(jq -c '{http_filter_hosts, platform_auto_allowed}' <<<"$rec")"
+
+  # API read-only
+  expect_passed HF.api-get "GET api.github.com/zen" \
+    '.host=="api.github.com" and .method=="GET" and .path=="/zen" and .filter=="allow" and .filter_rule=="*"' \
+    gh_zen -w ' %{http_code}'
+  expect_passed HF.api-head "HEAD api.github.com/" \
+    '.host=="api.github.com" and .method=="HEAD" and .filter=="allow"' \
+    curl -sS -m 15 -I -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/
+  expect_blocked HF.api-post "POST api.github.com/markdown (a write)" \
+    '.host=="api.github.com" and .method=="POST" and .verdict=="BLOCK" and .reason=="method-not-allowed" and .filter=="block" and .filter_rule=="*"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" -d '{"text":"hi"}' https://api.github.com/markdown
+  expect_blocked HF.api-gh-delete "gh api -X DELETE (a write via the gh CLI)" \
+    '.host=="api.github.com" and .method=="DELETE" and .verdict=="BLOCK" and .reason=="method-not-allowed"' \
+    gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/srt-does-not-exist-$RANDOM"
+  m=$(mark); out=$(curl -sS -m 15 -i -X PATCH -H "Authorization: Bearer $GH_TOKEN" -d '{}' "https://api.github.com/repos/$GITHUB_REPOSITORY" 2>&1)
+  grep -qi '^x-safer-runner: blocked' <<<"$out" && grep -q 'method-not-allowed' <<<"$out"
+  pass_if HF.refusal-response $? "PATCH answered by the proxy: $(head -1 <<<"$out" | tr -d '\r') / $(tail -1 <<<"$out")"
+
+  # git: fetch and push are both POST, so the path separates them
+  for form in dotgit plain; do
+    url=https://github.com/octocat/Hello-World; [ $form = dotgit ] && url=$url.git
+    rm -rf /tmp/hf-clone; out=$(git clone -q --depth 1 "$url" /tmp/hf-clone 2>&1)
+    pass_if HF.git-clone-$form $? "git clone $url -> ${out:-ok $(git -C /tmp/hf-clone rev-parse --short HEAD 2>/dev/null)}"
+  done
+  out=$(git fetch -q --depth 1 origin 2>&1); pass_if HF.git-fetch $? "git fetch origin in the checkout -> ${out:-ok}"
+
+  # A real push with the job token (contents: write, so git gets past discovery and sends the
+  # git-receive-pack POST). No carve-out names this repo, so the filter must refuse it.
+  br="srt-http-filter-probe-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RANDOM"
+  for form in dotgit plain; do
+    url=https://github.com/$GITHUB_REPOSITORY; [ $form = dotgit ] && url=$url.git
+    expect_blocked HF.git-push-$form "git push $url (no carve-out for this repo)" \
+      '.host=="github.com" and .method=="POST" and (.path|endswith("/git-receive-pack")) and .verdict=="BLOCK" and .reason=="path-not-allowed" and .filter_rule=="*/git-receive-pack"' \
+      git push "$url" "HEAD:refs/heads/$br-$form"
+    out=$(git ls-remote "$url" "refs/heads/$br-$form" 2>&1)
+    if [ -z "$out" ]; then record HF.git-push-$form-absent PASS "branch $br-$form does not exist on the remote"
+    else record HF.git-push-$form-absent FAIL "branch was created: $out"; git push -q "$url" --delete "$br-$form" || true; fi
+  done
+
+  # The carve-out matches the repo with and without .git (unauthenticated POST: the filter lets
+  # it through to GitHub, which answers 401/404 itself)
+  for form in plain dotgit; do
+    p=/portswigger-tim/srt-carveout; [ $form = dotgit ] && p=$p.git
+    expect_passed HF.carveout-$form "POST github.com$p/git-receive-pack (carve-out portswigger-tim/srt-carveout)" \
+      ".host==\"github.com\" and .path==\"$p/git-receive-pack\" and .filter==\"allow\" and .filter_rule==\"portswigger-tim/srt-carveout/git-receive-pack\"" \
+      curl -sS -m 15 -i -X POST -H 'Content-Type: application/x-git-receive-pack-request' --data-binary '' "https://github.com$p/git-receive-pack"
+  done
+
+  # A repo-specific deny holds however the URL spells the repo (GitHub ignores case and .git)
+  for url in https://github.com/octocat/Spoon-Knife https://github.com/octocat/Spoon-Knife.git https://github.com/OCTOCAT/spoon-knife.git; do
+    rm -rf /tmp/hf-sk
+    expect_blocked "HF.repo-deny-${url#https://github.com/}" "git clone $url (octocat/spoon-knife/* is NONE)" \
+      '.host=="github.com" and .verdict=="BLOCK" and .reason=="path-not-allowed"' \
+      git clone -q --depth 1 "$url" /tmp/hf-sk
+  done
+
+  # npm read-only: install yes, publish (PUT) no
+  d=$(mktemp -d)
+  out=$(npm install --prefix "$d" --no-audit --no-fund --loglevel=error left-pad 2>&1)
+  pass_if HF.npm-install $? "npm install left-pad (GET) -> ${out:-ok $(jq -r .version "$d/node_modules/left-pad/package.json" 2>/dev/null)}"
+  d=$(mktemp -d)
+  printf '{"name":"srt-http-filter-probe-%s","version":"0.0.0"}\n' "$RANDOM$RANDOM" > "$d/package.json"
+  printf '//registry.npmjs.org/:_authToken=npm_fakefakefakefakefakefakefakefakefake\n' > "$d/.npmrc"
+  expect_blocked HF.npm-publish "npm publish (PUT registry.npmjs.org, fake token)" \
+    '.host=="registry.npmjs.org" and .method=="PUT" and .verdict=="BLOCK" and .reason=="method-not-allowed"' \
+    bash -c "cd '$d' && npm publish --registry https://registry.npmjs.org/ --userconfig '$d/.npmrc' --loglevel=error"
+
+  render_report || return
+  report_has HF.report-refused '### 🔒 Refused by `http-filter`' "enforce report lists the refused requests"
+  report_has HF.report-fix 'to `http-filter`' "enforce report suggests the rule to add if the job needs it"
+}
+
+# Platform hosts the runner and first-party actions talk to.
+PLATFORM_HOSTS='^(results-receiver\\.actions\\.githubusercontent\\.com|productionresultssa[0-9]+\\.blob\\.core\\.windows\\.net|run-actions-.*\\.actions\\.githubusercontent\\.com)$'
+
+# enforce job, platform hosts filtered hard:
+#   results-receiver.actions.githubusercontent.com             { "*": NONE }
+#   productionresultssa*.blob.core.windows.net                 { "*": NONE }
+#   run-actions-*-azure-*.actions.githubusercontent.com        { "*": NONE }
+# Only the built-in platform allowlist (7 endpoints on these hosts) keeps step logs, artifacts,
+# cache, OIDC and the job lease working.
+http_filter_platform() {
+  local rec out code host
+  rec=$(jq -c 'select(.ev=="start")' "$FLOWLOG" | tail -1)
+  jq -e '.http_filter_hosts == 3 and .platform_auto_allowed == 7' <<<"$rec" >/dev/null
+  pass_if HP.platform-loaded $? "proxy start record: $(jq -c '{http_filter_hosts, platform_auto_allowed}' <<<"$rec") (want 3 hosts, 7 platform endpoints)"
+
+  # OIDC token (GET */idtoken/*): allowed only by its platform entry. Never print the token.
+  expect_passed HP.oidc-token "OIDC token request (GET ACTIONS_ID_TOKEN_REQUEST_URL)" \
+    '(.host|test("^run-actions-")) and .method=="GET" and (.path|test("/idtoken/")) and .filter=="platform"' \
+    curl -sS -m 20 -f -o /dev/null -w '%{http_code}' -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=srt-http-filter"
+  host=$(sed -E 's#^https://([^/]+)/.*#\1#' <<<"$ACTIONS_ID_TOKEN_REQUEST_URL")
+  expect_blocked HP.oidc-host-filtered "GET https://$host/srt-probe (filter is live on the OIDC host)" \
+    ".host==\"$host\" and .path==\"/srt-probe\" and .verdict==\"BLOCK\" and .reason==\"path-not-allowed\"" \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' "https://$host/srt-probe"
+  expect_blocked HP.results-receiver-filtered "GET results-receiver /srt-probe (\"*\": NONE)" \
+    '.host=="results-receiver.actions.githubusercontent.com" and .path=="/srt-probe" and .verdict=="BLOCK" and .reason=="path-not-allowed"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' https://results-receiver.actions.githubusercontent.com/srt-probe
+}
+
+# After artifact upload/download and cache save/restore ran under that filter.
+http_filter_platform_audit() {
+  local n refused host m want rec
+  for want in 'results-receiver.actions.githubusercontent.com POST' 'blob.core.windows.net PUT' 'blob.core.windows.net GET'; do
+    read -r host m <<<"$want"
+    n=$(jq -c "select(.filter==\"platform\" and .method==\"$m\" and (.host|endswith(\"$host\")))" "$FLOWLOG" | wc -l)
+    [ "$n" -gt 0 ]; pass_if "HP.platform-$m-${host%%.*}" $? "$n $m requests to *$host allowed by the built-in platform list"
+  done
+  host=$(jq -r 'select(.filter=="platform" and (.host|endswith("blob.core.windows.net"))) | .host' "$FLOWLOG" | head -1)
+  [ -n "$host" ] && expect_blocked HP.blob-filtered "GET $host/srt-probe (\"*\": NONE)" \
+    ".host==\"$host\" and .path==\"/srt-probe\" and .verdict==\"BLOCK\" and .reason==\"path-not-allowed\"" \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' "https://$host/srt-probe"
+  # Every platform request the job made (runner, artifact, cache, OIDC) must have been allowed:
+  # anything refused here is an endpoint missing from the built-in list.
+  refused=$(jq -r "select(.filter==\"block\" and (.host // \"\" | test(\"$PLATFORM_HOSTS\")) and ((.path // \"\") | test(\"srt-probe\") | not)) | \"\(.method) \(.host) \(.path)\"" "$FLOWLOG" \
+    | sed -E 's/[0-9a-f-]{16,}/*/g; s#/[0-9]+/#/N/#g' | sort | uniq -c | awk '{printf "%s %s %s(x%s); ", $2, $3, $4, $1}')
+  [ -z "$refused" ]; pass_if HP.no-platform-refusals $? "platform requests refused by the filter: ${refused:-none}"
+  render_report || return
+  rec=$(jq -r 'select((.host // "" | test("^run-actions-")) and .method=="POST") | "\(.path | sub("^/[0-9]+/"; "/N/")) \(.filter)"' "$FLOWLOG" | sort | uniq -c | tr '\n' ' ')
+  record HP.job-lease INFO "run-actions POSTs seen so far: ${rec:-none}"
+  report_has HP.report-platform '7 GitHub platform endpoints auto-allowed' "report shows the platform count"
+}
+
+# enforce job, allow-github-platform: false; productionresultssa*.blob.core.windows.net
+# { "*": "*", "actions-cache/*": NONE }: with no platform list the cache upload is refused.
+http_filter_no_platform() {
+  local rec
+  rec=$(jq -c 'select(.ev=="start")' "$FLOWLOG" | tail -1)
+  jq -e '.http_filter_hosts == 1 and .platform_auto_allowed == 0' <<<"$rec" >/dev/null
+  pass_if HN.platform-off $? "proxy start record: $(jq -c '{http_filter_hosts, platform_auto_allowed}' <<<"$rec")"
+}
+
+http_filter_no_platform_audit() {
+  local rec
+  rec=$(jq -c 'select(.verdict=="BLOCK" and (.host|endswith(".blob.core.windows.net")) and .method=="PUT" and (.path|startswith("/actions-cache/")) and .reason=="path-not-allowed" and .filter_rule=="actions-cache/*")' "$FLOWLOG" | head -1)
+  [ -n "$rec" ]; pass_if HN.cache-upload-refused $? "cache blob PUT refused with the platform list off: ${rec:-<none>}"
+  rec=$(jq -c 'select(.filter=="platform")' "$FLOWLOG" | head -1)
+  [ -z "$rec" ]; pass_if HN.no-platform-allows $? "no request allowed as platform: ${rec:-none}"
+}
+
+# analyze job, http-filter: api.github.com { "*": GET, HEAD }; github.com { "*": "*", "*/git-receive-pack": NONE }
+http_filter_analyze() {
+  expect_passed HZ.api-post-would-block "POST api.github.com/markdown (analyze: allowed, logged)" \
+    '.host=="api.github.com" and .method=="POST" and .verdict=="WOULD_BLOCK" and .reason=="method-not-allowed" and .filter=="block"' \
+    curl -sS -m 15 -f -X POST -H "Authorization: Bearer $GH_TOKEN" -d '{"text":"hi"}' https://api.github.com/markdown
+  expect_passed HZ.push-would-block "POST github.com/octocat/Hello-World.git/git-receive-pack (unauthenticated)" \
+    '.host=="github.com" and (.path|endswith("/git-receive-pack")) and .verdict=="WOULD_BLOCK" and .reason=="path-not-allowed"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/x-git-receive-pack-request' --data-binary '' https://github.com/octocat/Hello-World.git/git-receive-pack
+  expect_passed HZ.api-get "GET api.github.com/zen" '.host=="api.github.com" and .method=="GET" and .filter=="allow"' gh_zen
+  render_report || return
+  report_has HZ.report-refused '### 🔒 Refused by `http-filter`' "analyze report lists what the filter would refuse"
+  report_has HZ.report-would-block '— would be blocked' "labelled as would-be-blocked"
+  report_has HZ.report-suggested 'Suggested <code>http-filter</code>' "analyze report has a suggested http-filter"
+  sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -q 'api.github.com'
+  pass_if HZ.report-suggested-api $? "suggestion covers api.github.com: $(sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -A3 'api.github.com' | tr '\n' ' ' | cut -c1-200)"
 }
 
 trap 'record "harness.$1" FAIL "checks.sh $1 aborted (line $LINENO)"' EXIT

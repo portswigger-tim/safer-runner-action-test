@@ -7,7 +7,7 @@ on:
         description: 'Run only this job, or all'
         type: choice
         default: all
-        options: [all, enforce, advisory, analyze, strict, crash, containers]
+        options: [all, enforce, advisory, analyze, strict, crash, containers, http-filter]
   push:
     branches:
       - main
@@ -25,6 +25,11 @@ permissions:
 jobs:
   suite:
     name: ubuntu-24.04
+    # suite.yml keeps every job read-only except the http-filter ones (real git push, OIDC)
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
     uses: ./.github/workflows/suite.yml
     with:
       os: ubuntu-24.04
