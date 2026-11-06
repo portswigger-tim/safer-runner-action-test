@@ -385,6 +385,9 @@ crash_recovery() {
   local before after code issuer out m rec
   local p_r0 p_pid0 p_pid1 d_r0 d_pid0 d_pid1
   wait_active() { local u=$1 t=${2:-30} i=0; while [ "$i" -lt "$t" ]; do systemctl is-active -q "$u" && return 0; sleep 1; i=$((i+1)); done; return 1; }
+  # systemd says "active" before mitmproxy has bound its listeners; the addon's start record
+  # (written once the proxy is running) since mark <m> says it is ready to take connections
+  wait_proxy_ready() { local m=$1 i=0; while [ "$i" -lt 30 ]; do [ -n "$(flows_q "$m" '.ev=="start"' | head -1)" ] && return 0; sleep 1; i=$((i+1)); done; return 1; }
 
   before=$(openssl x509 -in "$CA" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
   code=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
@@ -393,8 +396,10 @@ crash_recovery() {
   # --- proxy SIGKILL ---
   p_r0=$(systemctl show -p NRestarts --value safer-runner-proxy)
   p_pid0=$(systemctl show -p MainPID --value safer-runner-proxy)
+  m=$(mark)
   sudo -n systemctl kill -s KILL safer-runner-proxy
   wait_active safer-runner-proxy 30; pass_if CR.proxy-restarts $? "safer-runner-proxy active after SIGKILL; NRestarts $p_r0 -> $(systemctl show -p NRestarts --value safer-runner-proxy)"
+  wait_proxy_ready "$m"; pass_if CR.proxy-ready $? "restarted proxy logged its start record (listeners up)"
   p_pid1=$(systemctl show -p MainPID --value safer-runner-proxy)
   [ -n "$p_pid1" ] && [ "$p_pid1" != 0 ] && [ "$p_pid1" != "$p_pid0" ]; pass_if CR.proxy-new-pid $? "MainPID $p_pid0 -> $p_pid1"
   # the public CA on disk (what clients were told to trust) is reused, not regenerated
@@ -424,8 +429,9 @@ crash_recovery() {
   grep -q 'status: NXDOMAIN' <<<"$out"; pass_if CR.dns-deny-after $? "dig evil.example.org -> $(grep -oE 'status: [A-Z]+' <<<"$out" | head -1)"
 
   # --- both at once ---
+  m=$(mark)
   sudo -n systemctl kill -s KILL safer-runner-proxy safer-runner-dns
-  { wait_active safer-runner-proxy 30 && wait_active safer-runner-dns 30; }; pass_if CR.both-restart $? "proxy + dns both active after a simultaneous SIGKILL"
+  { wait_active safer-runner-proxy 30 && wait_active safer-runner-dns 30 && wait_proxy_ready "$m"; }; pass_if CR.both-restart $? "proxy + dns both active (proxy listening) after a simultaneous SIGKILL"
   code=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
   [ "$code" = 200 ]; pass_if CR.both-egress-recovers $? "api.github.com/zen -> $code after killing proxy+dns together"
 }
@@ -610,7 +616,12 @@ http_filter() {
   report_has HF.report-invalid-method '`INVALID`' "a non-standard method is shown as INVALID"
   ! grep -q SRTCANARY "$REPORT" "${REPORT%.md}.log"; pass_if HF.report-no-method-token $? "the method token appears nowhere in the report or the post-step log"
   report_has HF.report-refused '### 🔒 Refused by `http-filter`' "enforce report lists the refused requests"
-  report_has HF.report-fix 'to `http-filter`' "enforce report suggests the rule to add if the job needs it"
+  # refused paths are never shown (the sender chose them; they can carry data): the refused
+  # requests' canary path segments must not appear in the report or the post-step log
+  report_has HF.report-path-hidden '‹path hidden›' "a refused request's path is shown as hidden"
+  ! grep -qE 'srt-does-not-exist|srt-http-filter-probe' "$REPORT" "${REPORT%.md}.log"
+  pass_if HF.report-no-refused-path $? "no refused path (DELETE …/srt-does-not-exist-*, npm PUT /srt-http-filter-probe-*) in the report or the post-step log"
+  report_has HF.report-analyze-note "run it in analyze mode without that host's \`http-filter\` entry" "enforce report says how to allow a needed request"
 }
 
 # Platform hosts the runner and first-party actions talk to.
