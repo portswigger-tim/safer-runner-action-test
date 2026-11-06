@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # safer-runner real-runner checks.
-# usage: checks.sh <must-pass|must-fail|sudo-must-fail|ssrf|analyze|strict|privilege-removed|privilege-retained|crash-recovery|supply-chain|baseline|http-filter[-platform[-audit]|-no-platform[-audit]|-analyze]>
+# usage: checks.sh <must-pass|must-fail|sudo-must-fail|ssrf|analyze|strict|privilege-removed|privilege-retained|crash-recovery|supply-chain|baseline|http-filter[-split[-audit]|-no-platform[-audit]|-analyze|-git-deny|-selftest|-invalid]>
 set -u
 cd "$(dirname "$0")/.."
 source tests/lib.sh
@@ -385,6 +385,9 @@ crash_recovery() {
   local before after code issuer out m rec
   local p_r0 p_pid0 p_pid1 d_r0 d_pid0 d_pid1
   wait_active() { local u=$1 t=${2:-30} i=0; while [ "$i" -lt "$t" ]; do systemctl is-active -q "$u" && return 0; sleep 1; i=$((i+1)); done; return 1; }
+  # systemd says "active" before mitmproxy has bound its listeners; the addon's start record
+  # (written once the proxy is running) since mark <m> says it is ready to take connections
+  wait_proxy_ready() { local m=$1 i=0; while [ "$i" -lt 30 ]; do [ -n "$(flows_q "$m" '.ev=="start"' | head -1)" ] && return 0; sleep 1; i=$((i+1)); done; return 1; }
 
   before=$(openssl x509 -in "$CA" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
   code=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
@@ -393,8 +396,10 @@ crash_recovery() {
   # --- proxy SIGKILL ---
   p_r0=$(systemctl show -p NRestarts --value safer-runner-proxy)
   p_pid0=$(systemctl show -p MainPID --value safer-runner-proxy)
+  m=$(mark)
   sudo -n systemctl kill -s KILL safer-runner-proxy
   wait_active safer-runner-proxy 30; pass_if CR.proxy-restarts $? "safer-runner-proxy active after SIGKILL; NRestarts $p_r0 -> $(systemctl show -p NRestarts --value safer-runner-proxy)"
+  wait_proxy_ready "$m"; pass_if CR.proxy-ready $? "restarted proxy logged its start record (listeners up)"
   p_pid1=$(systemctl show -p MainPID --value safer-runner-proxy)
   [ -n "$p_pid1" ] && [ "$p_pid1" != 0 ] && [ "$p_pid1" != "$p_pid0" ]; pass_if CR.proxy-new-pid $? "MainPID $p_pid0 -> $p_pid1"
   # the public CA on disk (what clients were told to trust) is reused, not regenerated
@@ -424,8 +429,9 @@ crash_recovery() {
   grep -q 'status: NXDOMAIN' <<<"$out"; pass_if CR.dns-deny-after $? "dig evil.example.org -> $(grep -oE 'status: [A-Z]+' <<<"$out" | head -1)"
 
   # --- both at once ---
+  m=$(mark)
   sudo -n systemctl kill -s KILL safer-runner-proxy safer-runner-dns
-  { wait_active safer-runner-proxy 30 && wait_active safer-runner-dns 30; }; pass_if CR.both-restart $? "proxy + dns both active after a simultaneous SIGKILL"
+  { wait_active safer-runner-proxy 30 && wait_active safer-runner-dns 30 && wait_proxy_ready "$m"; }; pass_if CR.both-restart $? "proxy + dns both active (proxy listening) after a simultaneous SIGKILL"
   code=$(gh_zen -o /dev/null -w '%{http_code}' 2>&1)
   [ "$code" = 200 ]; pass_if CR.both-egress-recovers $? "api.github.com/zen -> $code after killing proxy+dns together"
 }
@@ -601,60 +607,108 @@ http_filter() {
     '.host=="registry.npmjs.org" and .method=="PUT" and .verdict=="BLOCK" and .reason=="method-not-allowed"' \
     bash -c "cd '$d' && npm publish --registry https://registry.npmjs.org/ --userconfig '$d/.npmrc' --loglevel=error"
 
+  # a non-standard method: refused, and the report never echoes the token (it can carry data)
+  expect_blocked HF.custom-method "SRTCANARY7F3E9 request to api.github.com (GET/HEAD only)" \
+    '.host=="api.github.com" and .method=="SRTCANARY7F3E9" and .verdict=="BLOCK" and .reason=="method-not-allowed"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' -X SRTCANARY7F3E9 https://api.github.com/zen
+
   render_report || return
+  report_has HF.report-invalid-method '`INVALID`' "a non-standard method is shown as INVALID"
+  ! grep -q SRTCANARY "$REPORT" "${REPORT%.md}.log"; pass_if HF.report-no-method-token $? "the method token appears nowhere in the report or the post-step log"
   report_has HF.report-refused '### 🔒 Refused by `http-filter`' "enforce report lists the refused requests"
-  report_has HF.report-fix 'to `http-filter`' "enforce report suggests the rule to add if the job needs it"
+  # refused paths are never shown (the sender chose them; they can carry data): the refused
+  # requests' canary path segments must not appear in the report or the post-step log
+  report_has HF.report-path-hidden '‹path hidden›' "a refused request's path is shown as hidden"
+  ! grep -qE 'srt-does-not-exist|srt-http-filter-probe' "$REPORT" "${REPORT%.md}.log"
+  pass_if HF.report-no-refused-path $? "no refused path (DELETE …/srt-does-not-exist-*, npm PUT /srt-http-filter-probe-*) in the report or the post-step log"
+  report_has HF.report-analyze-note "run it in analyze mode without that host's \`http-filter\` entry" "enforce report says how to allow a needed request"
 }
 
 # Platform hosts the runner and first-party actions talk to.
 PLATFORM_HOSTS='^(results-receiver\\.actions\\.githubusercontent\\.com|productionresultssa[0-9]+\\.blob\\.core\\.windows\\.net|run-actions-.*\\.actions\\.githubusercontent\\.com)$'
+# Optional platform endpoints: a job's own rule wins over them. Under a job's NONE on these hosts
+# the job degrades but completes (validated on real runners): step status updates are refused
+# (invisible: the jobs API still shows every step), step logs are refused (the job log is lost),
+# artifact and cache fail.
+OPTIONAL_PATHS='(WorkflowStepUpdateService|ArtifactService|CacheService)/|/logs/|/artifacts/|^/actions-cache/'
 
-# enforce job, platform hosts filtered hard:
-#   results-receiver.actions.githubusercontent.com             { "*": NONE }
-#   productionresultssa*.blob.core.windows.net                 { "*": NONE }
-#   run-actions-*-azure-*.actions.githubusercontent.com        { "*": NONE }
-# Only the built-in platform allowlist (7 endpoints on these hosts) keeps step logs, artifacts,
-# cache, OIDC and the job lease working.
-http_filter_platform() {
-  local rec out code host
-  rec=$(jq -c 'select(.ev=="start")' "$FLOWLOG" | tail -1)
-  jq -e '.http_filter_hosts == 3 and .platform_auto_allowed == 7' <<<"$rec" >/dev/null
-  pass_if HP.platform-loaded $? "proxy start record: $(jq -c '{http_filter_hosts, platform_auto_allowed}' <<<"$rec") (want 3 hosts, 7 platform endpoints)"
-
-  # OIDC token (GET */idtoken/*): allowed only by its platform entry. Never print the token.
-  expect_passed HP.oidc-token "OIDC token request (GET ACTIONS_ID_TOKEN_REQUEST_URL)" \
+# Enforce jobs that filter platform hosts "*": NONE ($SPLIT says which; run-actions-*-azure-* is
+# always "*": NONE too):
+#   receiver: results-receiver.actions.githubusercontent.com
+#   blob:     productionresultssa*.blob.core.windows.net
+#   both:     both of them
+# Essential (job lease and completion, OIDC, the step-log RPCs and live log stream) stays allowed;
+# the rest is optional, so the job's NONE refuses it and the job degrades but completes - the
+# verdict job in http-filter-platform-split.yml checks that each job closes without a hang.
+http_filter_split() {
+  local host
+  # the run-actions host is filtered in every config; the OIDC token (GET */idtoken/*) is
+  # essential there. Never print the token.
+  expect_passed HS.oidc-token "OIDC token request (GET ACTIONS_ID_TOKEN_REQUEST_URL)" \
     '(.host|test("^run-actions-")) and .method=="GET" and (.path|test("/idtoken/")) and .filter=="platform"' \
     curl -sS -m 20 -f -o /dev/null -w '%{http_code}' -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=srt-http-filter"
   host=$(sed -E 's#^https://([^/]+)/.*#\1#' <<<"$ACTIONS_ID_TOKEN_REQUEST_URL")
-  expect_blocked HP.oidc-host-filtered "GET https://$host/srt-probe (filter is live on the OIDC host)" \
+  expect_blocked HS.oidc-host-filtered "GET https://$host/srt-probe (filter is live on the OIDC host)" \
     ".host==\"$host\" and .path==\"/srt-probe\" and .verdict==\"BLOCK\" and .reason==\"path-not-allowed\"" \
     curl -sS -m 15 -o /dev/null -w '%{http_code}' "https://$host/srt-probe"
-  expect_blocked HP.results-receiver-filtered "GET results-receiver /srt-probe (\"*\": NONE)" \
-    '.host=="results-receiver.actions.githubusercontent.com" and .path=="/srt-probe" and .verdict=="BLOCK" and .reason=="path-not-allowed"' \
-    curl -sS -m 15 -o /dev/null -w '%{http_code}' https://results-receiver.actions.githubusercontent.com/srt-probe
+  if [ "$SPLIT" != blob ]; then
+    expect_blocked HS.results-receiver-filtered "GET results-receiver /srt-probe" \
+      '.host=="results-receiver.actions.githubusercontent.com" and .path=="/srt-probe" and .verdict=="BLOCK" and .reason=="path-not-allowed"' \
+      curl -sS -m 15 -o /dev/null -w '%{http_code}' https://results-receiver.actions.githubusercontent.com/srt-probe
+  fi
+  if [ "$SPLIT" != receiver ]; then
+    host=$(jq -r 'select(.host // "" | test("^productionresultssa[0-9]+\\.blob")) | .host' "$FLOWLOG" | head -1)
+    host=${host:-productionresultssa0.blob.core.windows.net}
+    expect_blocked HS.blob-filtered "GET $host/srt-probe" \
+      ".host==\"$host\" and .path==\"/srt-probe\" and .verdict==\"BLOCK\" and .reason==\"path-not-allowed\"" \
+      curl -sS -m 15 -o /dev/null -w '%{http_code}' "https://$host/srt-probe"
+  fi
 }
 
-# After artifact upload/download and cache save/restore ran under that filter.
-http_filter_platform_audit() {
-  local n refused host m want rec
-  for want in 'results-receiver.actions.githubusercontent.com POST' 'blob.core.windows.net PUT' 'blob.core.windows.net GET'; do
-    read -r host m <<<"$want"
-    n=$(jq -c "select(.filter==\"platform\" and .method==\"$m\" and (.host|endswith(\"$host\")))" "$FLOWLOG" | wc -l)
-    [ "$n" -gt 0 ]; pass_if "HP.platform-$m-${host%%.*}" $? "$n $m requests to *$host allowed by the built-in platform list"
-  done
-  host=$(jq -r 'select(.filter=="platform" and (.host|endswith("blob.core.windows.net"))) | .host' "$FLOWLOG" | head -1)
-  [ -n "$host" ] && expect_blocked HP.blob-filtered "GET $host/srt-probe (\"*\": NONE)" \
-    ".host==\"$host\" and .path==\"/srt-probe\" and .verdict==\"BLOCK\" and .reason==\"path-not-allowed\"" \
-    curl -sS -m 15 -o /dev/null -w '%{http_code}' "https://$host/srt-probe"
-  # Every platform request the job made (runner, artifact, cache, OIDC) must have been allowed:
-  # anything refused here is an endpoint missing from the built-in list.
-  refused=$(jq -r "select(.filter==\"block\" and (.host // \"\" | test(\"$PLATFORM_HOSTS\")) and ((.path // \"\") | test(\"srt-probe\") | not)) | \"\(.method) \(.host) \(.path)\"" "$FLOWLOG" \
+# After the artifact upload and cache save/restore steps ran under that filter.
+http_filter_split_audit() {
+  local rec refused n essential all
+  if [ "$SPLIT" != blob ]; then
+    rec=$(jq -c 'select(.verdict=="BLOCK" and .host=="results-receiver.actions.githubusercontent.com" and (.path|test("ArtifactService/")) and .filter=="block")' "$FLOWLOG" | head -1)
+    [ -n "$rec" ]; pass_if HS.artifact-refused $? "artifact RPC refused by the job's NONE (optional platform entry yields): ${rec:-<none>}"
+    rec=$(jq -c 'select(.verdict=="BLOCK" and .host=="results-receiver.actions.githubusercontent.com" and (.path|test("CacheService/")) and .filter=="block")' "$FLOWLOG" | head -1)
+    [ -n "$rec" ]; pass_if HS.cache-refused $? "cache RPC refused by the job's NONE: ${rec:-<none>}"
+    n=$(jq -c 'select(.filter=="platform" and .host=="results-receiver.actions.githubusercontent.com" and (.path|test("^/twirp/results\\.services\\.receiver\\.Receiver/")))' "$FLOWLOG" | wc -l)
+    [ "$n" -gt 0 ]; pass_if HS.step-logs-allowed $? "$n step-log RPCs (Receiver/*) allowed as essential platform"
+  fi
+  n=$(jq -c 'select(.filter=="platform" and (.host|test("^run-actions-")) and (.path|endswith("/renewjob")))' "$FLOWLOG" | wc -l)
+  [ "$n" -gt 0 ]; pass_if HS.renewjob-allowed $? "$n job-lease renewals allowed as essential platform"
+  essential=$(jq -r '.http_filter.platform_auto_allowed // empty' /etc/safer-runner/policy.json 2>/dev/null)
+  # with results-receiver refused too, artifact and cache stop at their RPCs before any blob upload
+  if [ "$SPLIT" = blob ]; then
+    rec=$(jq -c 'select(.verdict=="BLOCK" and (.host|test("^productionresultssa[0-9]+\\.blob")) and .method=="PUT" and (.path|test("/artifacts/")))' "$FLOWLOG" | head -1)
+    [ -n "$rec" ]; pass_if HS.artifact-blob-refused $? "artifact blob upload refused by the job's NONE: ${rec:-<none>}"
+    rec=$(jq -c 'select(.verdict=="BLOCK" and (.host|test("^productionresultssa[0-9]+\\.blob")) and (.path|startswith("/actions-cache/")))' "$FLOWLOG" | head -1)
+    [ -n "$rec" ]; pass_if HS.cache-blob-refused $? "cache blob upload refused by the job's NONE: ${rec:-<none>}"
+  fi
+  # Only optional endpoints may be refused: anything else refused on a platform host (other than
+  # our probe) is essential control plane the built-in list is missing.
+  refused=$(jq -r "select(.filter==\"block\" and (.host // \"\" | test(\"$PLATFORM_HOSTS\")) and ((.path // \"\") | test(\"srt-probe|$OPTIONAL_PATHS\") | not)) | \"\(.method) \(.host) \(.path)\"" "$FLOWLOG" \
     | sed -E 's/[0-9a-f-]{16,}/*/g; s#/[0-9]+/#/N/#g' | sort | uniq -c | awk '{printf "%s %s %s(x%s); ", $2, $3, $4, $1}')
-  [ -z "$refused" ]; pass_if HP.no-platform-refusals $? "platform requests refused by the filter: ${refused:-none}"
-  render_report || return
-  rec=$(jq -r 'select((.host // "" | test("^run-actions-")) and .method=="POST") | "\(.path | sub("^/[0-9]+/"; "/N/")) \(.filter)"' "$FLOWLOG" | sort | uniq -c | tr '\n' ' ')
-  record HP.job-lease INFO "run-actions POSTs seen so far: ${rec:-none}"
-  report_has HP.report-platform '7 GitHub platform endpoints auto-allowed' "report shows the platform count"
+  [ -z "$refused" ]; pass_if HS.only-optional-refused $? "essential requests refused: ${refused:-none}"
+  # the documented degradation, as expected refusals per config
+  if [ "$SPLIT" != blob ]; then
+    n=$(jq -c 'select(.filter=="block" and .host=="results-receiver.actions.githubusercontent.com" and (.path|test("WorkflowStepUpdateService/")))' "$FLOWLOG" | wc -l)
+    record HS.degraded-step-status INFO "$n step status updates refused (optional; the jobs API still shows each step's conclusion)"
+  fi
+  if [ "$SPLIT" != receiver ]; then
+    n=$(jq -c 'select(.filter=="block" and (.host|test("^productionresultssa[0-9]+\\.blob")) and (.path|test("/logs/")))' "$FLOWLOG" | wc -l)
+    [ "$n" -gt 0 ]; pass_if HS.degraded-step-logs $? "$n step-log uploads refused (optional: this job's own log is lost, the job still completes)"
+  fi
+  # every refused platform request, as an annotation too (this job's own log upload may be refused)
+  all=$(jq -r "select(.filter==\"block\" and (.host // \"\" | test(\"$PLATFORM_HOSTS\")) and ((.path // \"\") | test(\"srt-probe\") | not)) | \"\(.method) \(.host) \(.path)\"" "$FLOWLOG" \
+    | sed -E 's/[0-9a-f-]{16,}/*/g; s#/[0-9]+/#/N/#g' | sort | uniq -c | awk '{printf "%s %s %s(x%s); ", $2, $3, $4, $1}')
+  record HS.refused-platform INFO "${all:-none}"
+  echo "::notice title=HS refused platform requests ($SPLIT)::${all:-none}"
+  if [ -n "${essential:-}" ]; then
+    render_report || return
+    report_has HS.report-platform "$essential GitHub platform endpoints auto-allowed" "report shows the essential platform count"
+  fi
 }
 
 # enforce job, allow-github-platform: false; productionresultssa*.blob.core.windows.net
@@ -683,12 +737,114 @@ http_filter_analyze() {
     '.host=="github.com" and (.path|endswith("/git-receive-pack")) and .verdict=="WOULD_BLOCK" and .reason=="path-not-allowed"' \
     curl -sS -m 15 -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/x-git-receive-pack-request' --data-binary '' https://github.com/octocat/Hello-World.git/git-receive-pack
   expect_passed HZ.api-get "GET api.github.com/zen" '.host=="api.github.com" and .method=="GET" and .filter=="allow"' gh_zen
+  expect_passed HZ.custom-method "SRTCANARY7F3E9 request to api.github.com (analyze: logged)" \
+    '.host=="api.github.com" and .method=="SRTCANARY7F3E9" and .verdict=="WOULD_BLOCK"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' -X SRTCANARY7F3E9 https://api.github.com/zen
   render_report || return
+  report_has HZ.report-invalid-method '`INVALID`' "a non-standard method is shown as INVALID"
+  ! grep -q SRTCANARY "$REPORT" "${REPORT%.md}.log"; pass_if HZ.report-no-method-token $? "the method token appears nowhere in the report or the post-step log"
+  ! sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -q 'INVALID'
+  pass_if HZ.suggestion-no-invalid $? "the suggested http-filter has no INVALID method"
   report_has HZ.report-refused '### 🔒 Refused by `http-filter`' "analyze report lists what the filter would refuse"
   report_has HZ.report-would-block '— would be blocked' "labelled as would-be-blocked"
   report_has HZ.report-suggested 'Suggested <code>http-filter</code>' "analyze report has a suggested http-filter"
   sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -q 'api.github.com'
   pass_if HZ.report-suggested-api $? "suggestion covers api.github.com: $(sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -A3 'api.github.com' | tr '\n' ' ' | cut -c1-200)"
+}
+
+# enforce job: a broad github.com baseline with repo-specific push denies:
+#   github.com { "*": "*", "portswigger-tim/safer-runner-action-test/git-receive-pack": NONE,
+#                "srt/x/git-receive-pack": NONE }
+# A real push with the job token (contents: write) to the denied repo must be refused however the
+# URL spells the repo, over HTTP/1.1 and HTTP/2; equivalent spellings of the path too.
+http_filter_git_deny() {
+  local out form url br ver rp p sel enc
+  for form in dotgit plain; do
+    url=https://github.com/$GITHUB_REPOSITORY; [ $form = dotgit ] && url=$url.git
+    rm -rf /tmp/gd-clone; out=$(git clone -q --depth 1 "$url" /tmp/gd-clone 2>&1)
+    pass_if GD.clone-$form $? "git clone $url (the denied repo is still readable) -> ${out:-ok}"
+  done
+  out=$(git fetch -q --depth 1 origin 2>&1); pass_if GD.fetch $? "git fetch origin -> ${out:-ok}"
+
+  rp='portswigger-tim/safer-runner-action-test/git-receive-pack'
+  sel='.host=="github.com" and .method=="POST" and (.path|ascii_downcase|test("git-receive-pack")) and .verdict=="BLOCK" and .reason=="path-not-allowed"'
+  br="srt-git-deny-probe-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RANDOM"
+  for ver in HTTP/1.1 HTTP/2; do
+    for form in plain dotgit mixedcase; do
+      case $form in
+        plain) url=https://github.com/$GITHUB_REPOSITORY ;;
+        dotgit) url=https://github.com/$GITHUB_REPOSITORY.git ;;
+        mixedcase) url=https://github.com/Portswigger-Tim/Safer-Runner-Action-Test.git ;;
+      esac
+      expect_blocked "GD.push-$form-${ver#HTTP/}" "git push ($ver) $url (rule $rp: NONE)" "$sel" \
+        git -c http.version="$ver" push "$url" "HEAD:refs/heads/$br-$form"
+      out=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY" "refs/heads/$br-$form" 2>&1)
+      if [ -z "$out" ]; then record "GD.push-$form-${ver#HTTP/}-absent" PASS "no branch $br-$form on the remote"
+      else record "GD.push-$form-${ver#HTTP/}-absent" FAIL "branch was created: $out"; git push -q "https://github.com/$GITHUB_REPOSITORY" --delete "$br-$form" || true; fi
+    done
+  done
+
+  # Equivalent spellings of a denied path, and the short repo name (unauthenticated POSTs: if
+  # the filter let one through, GitHub itself would refuse it)
+  for p in \
+    /portswigger-tim//safer-runner-action-test.git/git-receive-pack \
+    /portswigger-tim/safer-runner-action-test.git//git-receive-pack \
+    /portswigger-tim/safer-runner-action-test/git-receive-pack/ \
+    '/portswigger-tim/safer-runner-action-test;x/git-receive-pack' \
+    /portswigger-tim/safer-runner-action-test%2Egit/git-receive-pack \
+    '/portswigger-tim/public/..;/safer-runner-action-test/git-receive-pack' \
+    /portswigger-tim/public/../safer-runner-action-test.git/git-receive-pack \
+    /srt/x/git-receive-pack /srt/x.git/git-receive-pack /SRT/X.git/git-receive-pack; do
+    enc=$(printf '%s' "$p" | tr -c 'A-Za-z0-9' '_' | sed -E 's/_+/_/g' | cut -c2-60)
+    expect_blocked "GD.path-$enc" "POST github.com$p" '.host=="github.com" and .method=="POST" and .verdict=="BLOCK" and .reason=="path-not-allowed"' \
+      curl -sS -m 15 --path-as-is -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/x-git-receive-pack-request' --data-binary '' "https://github.com$p"
+  done
+  # the baseline really is broad: a push POST to any other repo passes the filter (GitHub answers)
+  expect_passed GD.baseline-other-repo "POST github.com/octocat/Hello-World.git/git-receive-pack (baseline *: *)" \
+    '.host=="github.com" and .path=="/octocat/Hello-World.git/git-receive-pack" and .filter=="allow" and .filter_rule=="*"' \
+    curl -sS -m 15 -i -X POST -H 'Content-Type: application/x-git-receive-pack-request' --data-binary '' https://github.com/octocat/Hello-World.git/git-receive-pack
+}
+
+# enforce job: github.com { "portswigger-tim/safer-runner-action-test/*": "*" } - a filter that
+# would refuse the action's own setup probe (GET github.com/robots.txt). Setup must pass, and the
+# probe's exemption must not open anything else.
+http_filter_selftest() {
+  local out bogus=192.0.2.1 r="--resolve github.com:443:192.0.2.1"
+  out=$(jq -c . /var/log/safer-runner/selftest.json 2>&1)
+  jq -e 'length == 3 and all(.ok)' /var/log/safer-runner/selftest.json >/dev/null 2>&1
+  pass_if ST.setup-selftests $? "setup passed with github.com filtered: $out"
+  expect_blocked ST.robots-filtered "GET github.com/robots.txt (an ordinary request: filtered)" \
+    '.host=="github.com" and .path=="/robots.txt" and .verdict=="BLOCK" and .reason=="path-not-allowed"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' https://github.com/robots.txt
+  expect_passed ST.probe-exempt "the exact setup probe (GET /robots.txt dialled at $bogus) is exempt" \
+    ".host==\"github.com\" and .path==\"/robots.txt\" and (.dst|startswith(\"$bogus:\")) and (has(\"filter\")|not)" \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' $r https://github.com/robots.txt
+  # every variation of the probe is an ordinary request again
+  expect_blocked ST.probe-query "probe + query string" '.host=="github.com" and .verdict=="BLOCK" and .reason=="path-not-allowed"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' $r 'https://github.com/robots.txt?d=srt-canary'
+  expect_blocked ST.probe-post "probe as POST with a body" '.host=="github.com" and .method=="POST" and .verdict=="BLOCK"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' $r -X POST --data-binary 'srt-canary' https://github.com/robots.txt
+  expect_blocked ST.probe-case "probe with another path case" '.host=="github.com" and .path=="/Robots.txt" and .verdict=="BLOCK"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' $r https://github.com/Robots.txt
+  expect_blocked ST.probe-other-path "other path dialled at $bogus" '.host=="github.com" and .verdict=="BLOCK" and .reason=="path-not-allowed"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' $r https://github.com/octocat/Hello-World.git/info/refs
+  expect_blocked ST.probe-other-host "another host dialled at $bogus" '.sni=="evil.example.com" and .verdict=="BLOCK"' \
+    curl -sS -m 15 -o /dev/null -w '%{http_code}' --resolve "evil.example.com:443:$bogus" https://evil.example.com/robots.txt
+  out=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY" HEAD 2>&1)
+  pass_if ST.own-repo-readable $? "the filter still allows this repo: ${out:0:60}"
+}
+
+# enforce + an invalid http-filter: setup must fail closed (no analyze fallback). The action step
+# has continue-on-error so this step can look; a real job stops there.
+http_filter_invalid() { # SR_OUTCOME: the action step's outcome
+  [ "${SR_OUTCOME:-}" = failure ]; pass_if HI.action-failed $? "action step outcome: ${SR_OUTCOME:-<unset>} (want failure)"
+  # Nothing was installed in ANY mode: an analyze fallback would leave a marker, a policy and a
+  # running proxy writing a flow log. (The pre step's own conclusion can't show this: with
+  # continue-on-error a failed pre step is reported as success.)
+  [ ! -e /etc/safer-runner/setup-complete ]; pass_if HI.no-setup-marker $? "no setup-complete marker (nothing was set up, in any mode)"
+  [ ! -e /etc/safer-runner/policy.json ] && [ ! -e "$FLOWLOG" ]
+  pass_if HI.no-policy $? "no policy.json and no flow log"
+  ! systemctl is-active -q safer-runner-proxy 2>/dev/null; pass_if HI.no-proxy $? "safer-runner-proxy not running"
 }
 
 trap 'record "harness.$1" FAIL "checks.sh $1 aborted (line $LINENO)"' EXIT

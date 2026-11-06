@@ -77,6 +77,9 @@ finish() {
     echo '| id | result | detail |'; echo '|---|---|---|'
     sed 's/|/\\|/g' "$RESULTS" | awk -F'\t' '{print "| "$1" | "$2" | "$3" |"}'
   } >> "$GITHUB_STEP_SUMMARY"
+  # one annotation per failing check: visible through the checks API even when a job's own log
+  # upload is what the job is testing
+  grep $'\tFAIL\t' "$RESULTS" | while IFS=$'\t' read -r id _ detail; do echo "::error title=FAIL ${id}::${detail:0:400}"; done || true
   if grep -q $'\tFAIL\t' "$RESULTS"; then echo "::error::$(grep -c $'\tFAIL\t' "$RESULTS") check(s) failed"; exit 1; fi
 }
 

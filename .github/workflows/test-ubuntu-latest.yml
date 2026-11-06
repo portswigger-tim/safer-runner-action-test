@@ -50,7 +50,7 @@ jobs:
       - name: safer-runner in a job container
         id: sr
         continue-on-error: true
-        uses: portswigger-tim/safer-runner-action@v2.2.0
+        uses: portswigger-tim/safer-runner-action@v2.2.1 # v2.2.1 hotfix branch
         with:
           mode: ${{ matrix.mode }}
       - name: results
@@ -74,7 +74,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: safer-runner (enforce)
-        uses: portswigger-tim/safer-runner-action@v2.2.0
+        uses: portswigger-tim/safer-runner-action@v2.2.1 # v2.2.1 hotfix branch
         with:
           mode: enforce
           allowed-domains: 'api.github.com'
