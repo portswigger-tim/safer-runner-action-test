@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# safer-runner v2 real-runner checks.
+# safer-runner real-runner checks.
 # usage: checks.sh <must-pass|must-fail|sudo-must-fail|ssrf|analyze|strict|privilege-removed|privilege-retained|crash-recovery|supply-chain|baseline>
 set -u
 cd "$(dirname "$0")/.."
-source v2test/lib.sh
+source tests/lib.sh
 
 must_pass() {
   local code issuer out

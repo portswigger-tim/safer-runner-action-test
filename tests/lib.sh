@@ -1,5 +1,5 @@
-# Helpers for the safer-runner v2 real-runner suite. Source me.
-RESULTS="${RUNNER_TEMP:-/tmp}/v2-results.tsv"
+# Helpers for the safer-runner real-runner suite. Source me.
+RESULTS="${RUNNER_TEMP:-/tmp}/safer-runner-results.tsv"
 FLOWLOG=/var/log/safer-runner/proxy-flows.jsonl
 # Stand-in "attacker" IP: a real, always-up HTTPS/HTTP server that is NOT on any allowlist.
 ATTACKER_IP=1.1.1.1
@@ -70,7 +70,7 @@ finish() {
   github_refusals
   echo "=== RESULTS"; column -t -s $'\t' "$RESULTS" || cat "$RESULTS"
   {
-    echo "## v2 suite: $1"
+    echo "## safer-runner suite: $1"
     echo '| id | result | detail |'; echo '|---|---|---|'
     sed 's/|/\\|/g' "$RESULTS" | awk -F'\t' '{print "| "$1" | "$2" | "$3" |"}'
   } >> "$GITHUB_STEP_SUMMARY"

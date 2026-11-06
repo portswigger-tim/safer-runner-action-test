@@ -2,6 +2,12 @@ name: Test (ubuntu-latest)
 
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        description: 'Run only this job, or all'
+        type: choice
+        default: all
+        options: [all, enforce, advisory, analyze, strict, crash, containers]
   push:
     branches:
       - main
@@ -12,31 +18,65 @@ on:
     # Weekly, to catch GitHub runner-image drift before consumers hit it.
     - cron: '17 6 * * 1'
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   suite:
     name: ubuntu-latest
     uses: ./.github/workflows/suite.yml
     with:
       os: ubuntu-latest
+      only: ${{ inputs.only || 'all' }}
 
-  ubuntu-latest-soak:
-    name: ubuntu-latest soak ${{ matrix.rep }} (enforce + disable-sudo)
+  # A job container is unsupported: enforce fails the step, analyze warns (F3).
+  job-container:
+    if: ${{ (inputs.only || 'all') == 'all' || inputs.only == 'containers' }}
+    name: job container (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: node:24-bookworm-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [enforce, analyze]
+    steps:
+      - name: safer-runner in a job container
+        id: sr
+        continue-on-error: true
+        uses: portswigger-tim/safer-runner-action@main
+        with:
+          mode: ${{ matrix.mode }}
+      - name: results
+        shell: bash
+        run: |
+          echo "outcome=${{ steps.sr.outcome }}"
+          want=${{ matrix.mode == 'enforce' && 'failure' || 'success' }}
+          echo "## job container (${{ matrix.mode }}): action step ${{ steps.sr.outcome }} (want $want)" >> "$GITHUB_STEP_SUMMARY"
+          [ "${{ steps.sr.outcome }}" = "$want" ]
+
+  # Repeat a minimal enforce on fresh ubuntu-latest VMs: the resolver must come up and answer
+  # for an allowed name every time (guards start-up races that only show on some VM images).
+  soak:
+    if: ${{ (inputs.only || 'all') == 'all' || inputs.only == 'enforce' }}
+    name: ubuntu-latest soak ${{ matrix.rep }} (enforce)
     strategy:
       fail-fast: false
       matrix:
         rep: [1, 2, 3, 4, 5]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Apply Safer Runner Action (enforce + disable-sudo)
+      - name: safer-runner (enforce)
         uses: portswigger-tim/safer-runner-action@main
         with:
-          mode: 'enforce'
+          mode: enforce
           allowed-domains: 'api.github.com'
-      - name: dnsmasq started and an allowed domain resolves on this VM
+      - name: resolver started and an allowed domain resolves on this VM
         run: |
-          echo ":53 listeners:"; sudo ss -lntup 'sport = :53' || true
           ans=$(dig +short +time=5 +tries=2 @127.0.0.1 api.github.com A || true)
           echo "api.github.com A -> ${ans:-<empty>}"
           if [ -z "$ans" ]; then
-            echo "::error::dnsmasq up but allowed domain did not resolve on this VM"; exit 1
+            echo "::error::resolver up but allowed domain did not resolve on this VM"; exit 1
           fi

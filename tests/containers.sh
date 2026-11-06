@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# safer-runner v2 P2: container egress checks (ported from the spike, spike/v2-containers p2/).
+# safer-runner container egress checks (ported from the spike, spike/v2-containers p2/).
 # usage: containers.sh <section> [args]
 #   pull | service <svc-id> | traffic | dns | posture | front-door | failclosed | restart
 #   | build | probe-log <expect: contained|open> | analyze
