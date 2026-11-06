@@ -1,0 +1,111 @@
+name: http-filter platform split (experiment)
+
+# Which platform requests does a job need? Filter the platform hosts "*": NONE and see which
+# requests are refused and whether the job still completes. The run-actions host is always
+# "*": NONE too, so only the essential tier (logs/status, job lease + completion, OIDC) passes.
+#   receiver: results-receiver.actions.githubusercontent.com "*": NONE
+#   blob:     productionresultssa*.blob.core.windows.net "*": NONE
+#   both:     both
+# Artifact and cache are optional: the job's NONE must refuse them. Jobs are continue-on-error
+# (a degraded job is the data, not a suite failure); the verdict job reports each job's conclusion,
+# how long it took to close after its last step (a hang), and its annotations.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/http-filter-platform-split.yml
+      - tests/**
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  split:
+    name: split ${{ matrix.split }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
+        split: [receiver, blob, both]
+    env:
+      SPLIT: ${{ matrix.split }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: safer-runner (enforce, platform hosts filtered to NONE)
+        uses: portswigger-tim/safer-runner-action@931f6cf346fc18cbb153014de57e2fafe674ffca # v2.2.1 hotfix branch
+        with:
+          mode: enforce
+          http-filter: |
+            run-actions-*-azure-*.actions.githubusercontent.com: { "*": NONE }
+            ${{ matrix.split != 'blob' && 'results-receiver.actions.githubusercontent.com: { "*": NONE }' || '' }}
+            ${{ matrix.split != 'receiver' && 'productionresultssa*.blob.core.windows.net: { "*": NONE }' || '' }}
+      - uses: actions/checkout@v7
+      - name: OIDC + the filter is live on each filtered host
+        run: tests/checks.sh http-filter-split || true
+      - name: outlive a job-lease renewal (the runner renews about once a minute)
+        run: sleep 75
+      - run: mkdir -p art cache-dir && head -c 1000000 /dev/urandom > art/payload.bin && cp art/payload.bin cache-dir/
+      - uses: actions/upload-artifact@v7
+        id: up
+        continue-on-error: true
+        with:
+          name: split-${{ matrix.split }}-${{ matrix.os }}
+          path: art/payload.bin
+          retention-days: 1
+      - uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: cache-dir
+          key: split-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.split }}-${{ matrix.os }}
+      - run: sleep 10
+      - uses: actions/cache/restore@v6
+        id: restore
+        continue-on-error: true
+        with:
+          path: cache-dir
+          key: split-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.split }}-${{ matrix.os }}
+          fail-on-cache-miss: true
+      - name: refused requests + control plane
+        if: always()
+        run: tests/checks.sh http-filter-split-audit || true
+      - name: results
+        if: always()
+        run: |
+          source tests/lib.sh
+          [ "${{ steps.up.outcome }}" = failure ]; pass_if HS.artifact-upload-failed $? "upload-artifact: ${{ steps.up.outcome }} (want failure: optional, the job's NONE wins)"
+          [ "${{ steps.restore.outcome }}" = failure ]; pass_if HS.cache-miss $? "cache restore: ${{ steps.restore.outcome }} (want failure)"
+          finish "http-filter split ${{ matrix.split }} / ${{ matrix.os }}"
+
+  verdict:
+    needs: split
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: conclusion, close lag, annotations per split job
+        run: |
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
+          {
+            echo "## http-filter platform split"
+            echo '| job | conclusion | last step done | job closed | close lag (s) |'; echo '|---|---|---|---|---|'
+            jq -r '.jobs[] | select(.name|startswith("split ")) |
+              (.steps | map(select(.completed_at != null and (.name|test("^(Post |Complete job)")|not))) | max_by(.number) | .completed_at) as $last |
+              "| \(.name) | \(.conclusion) | \($last) | \(.completed_at) | \(((.completed_at|fromdateiso8601) - ($last|fromdateiso8601)))|"' <<<"$jobs"
+            for id in $(jq -r '.jobs[] | select(.name|startswith("split ")) | .id' <<<"$jobs"); do
+              name=$(jq -r ".jobs[] | select(.id==$id) | .name" <<<"$jobs")
+              echo; echo "### $name"
+              gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" --jq '.[] | "- \(.annotation_level): \(.title // "") \(.message | gsub("\n"; " ") | .[0:600])"'
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
