@@ -611,10 +611,10 @@ http_filter_platform() {
   jq -e '.http_filter_hosts == 3 and .platform_auto_allowed == 4' <<<"$rec" >/dev/null
   pass_if HP.platform-loaded $? "proxy start record: $(jq -c '{http_filter_hosts, platform_auto_allowed}' <<<"$rec") (want 3 hosts, 4 platform endpoints)"
 
-  # OIDC token (GET */idtoken/*): allowed only by its platform entry
+  # OIDC token (GET */idtoken/*): allowed only by its platform entry. Never print the token.
   expect_passed HP.oidc-token "OIDC token request (GET ACTIONS_ID_TOKEN_REQUEST_URL)" \
     '(.host|test("^run-actions-")) and .method=="GET" and (.path|test("/idtoken/")) and .filter=="platform"' \
-    curl -sS -m 20 -f -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=srt-http-filter"
+    curl -sS -m 20 -f -o /dev/null -w '%{http_code}' -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=srt-http-filter"
   host=$(sed -E 's#^https://([^/]+)/.*#\1#' <<<"$ACTIONS_ID_TOKEN_REQUEST_URL")
   expect_blocked HP.oidc-host-filtered "GET https://$host/srt-probe (filter is live on the OIDC host)" \
     ".host==\"$host\" and .path==\"/srt-probe\" and .verdict==\"BLOCK\" and .reason==\"method-not-allowed\"" \
