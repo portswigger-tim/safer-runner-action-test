@@ -1,0 +1,71 @@
+name: Probe (http-filter job-lease endpoints)
+
+# TEMPORARY - remove before merging. Does the runner's job completion (POST */completejob on the
+# run-actions host) go through the proxy, so the built-in platform list needs it?
+#   locked:   platform list on, the run-actions host "*": NONE -> only platform entries pass
+#   denied:   platform list off, only */completejob refused -> does the job still complete?
+# The verdict job compares the two jobs' conclusions and how long each took to finish after
+# its last step.
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/probe-completejob.yml
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  locked:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: portswigger-tim/safer-runner-action@aefab7ba88ea70af992c0fa528c577ae846a5594 # http-filter branch
+        with:
+          mode: enforce
+          http-filter: |
+            run-actions-*-azure-*.actions.githubusercontent.com: { "*": NONE }
+      - name: outlive a lease renewal
+        run: sleep 75
+      - name: run-actions requests so far
+        run: jq -c 'select(.host // "" | test("^run-actions-"))' /var/log/safer-runner/proxy-flows.jsonl
+
+  denied:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: portswigger-tim/safer-runner-action@aefab7ba88ea70af992c0fa528c577ae846a5594 # http-filter branch
+        with:
+          mode: enforce
+          allow-github-platform: false
+          http-filter: |
+            run-actions-*-azure-*.actions.githubusercontent.com:
+              "*": "*"
+              "*/completejob": NONE
+      - name: outlive a lease renewal
+        run: sleep 75
+      - name: run-actions requests so far
+        run: jq -c 'select(.host // "" | test("^run-actions-"))' /var/log/safer-runner/proxy-flows.jsonl
+
+  verdict:
+    needs: [locked, denied]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: conclusions and finish lag
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+            --jq '.jobs[] | select(.name != "verdict") | {name, conclusion, started_at, completed_at,
+                  last_step: (.steps | map(select(.completed_at != null)) | max_by(.number) | {name, completed_at})}' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          for id in $(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" --jq '.jobs[] | select(.name != "verdict") | .id'); do
+            gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" --jq '.[] | "\(.annotation_level): \(.message)"' | sed "s/^/job $id: /" | tee -a "$GITHUB_STEP_SUMMARY"
+          done

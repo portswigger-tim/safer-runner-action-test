@@ -527,7 +527,8 @@ JSON
 # enforce job: http-filter (see suite.yml) =
 #   api.github.com     { "*": GET, HEAD }
 #   registry.npmjs.org { "*": GET, HEAD }
-#   github.com         { "*": "*", "*/git-receive-pack": NONE, "portswigger-tim/srt-carveout/git-receive-pack": "*" }
+#   github.com         { "*": "*", "*/git-receive-pack": NONE, "portswigger-tim/srt-carveout/git-receive-pack": "*",
+#                        "octocat/spoon-knife/*": NONE }
 http_filter() {
   local out rc rec m form url br code p d
   rec=$(jq -c 'select(.ev=="start")' "$FLOWLOG" | tail -1)
@@ -581,6 +582,14 @@ http_filter() {
       curl -sS -m 15 -i -X POST -H 'Content-Type: application/x-git-receive-pack-request' --data-binary '' "https://github.com$p/git-receive-pack"
   done
 
+  # A repo-specific deny holds however the URL spells the repo (GitHub ignores case and .git)
+  for url in https://github.com/octocat/Spoon-Knife https://github.com/octocat/Spoon-Knife.git https://github.com/OCTOCAT/spoon-knife.git; do
+    rm -rf /tmp/hf-sk
+    expect_blocked "HF.repo-deny-${url#https://github.com/}" "git clone $url (octocat/spoon-knife/* is NONE)" \
+      '.host=="github.com" and .verdict=="BLOCK" and .reason=="path-not-allowed"' \
+      git clone -q --depth 1 "$url" /tmp/hf-sk
+  done
+
   # npm read-only: install yes, publish (PUT) no
   d=$(mktemp -d)
   out=$(npm install --prefix "$d" --no-audit --no-fund --loglevel=error left-pad 2>&1)
@@ -603,13 +612,14 @@ PLATFORM_HOSTS='^(results-receiver\\.actions\\.githubusercontent\\.com|productio
 # enforce job, platform hosts filtered hard:
 #   results-receiver.actions.githubusercontent.com             { "*": NONE }
 #   productionresultssa*.blob.core.windows.net                 { "*": NONE }
-#   run-actions-*-azure-*.actions.githubusercontent.com        { "*": POST }   (OIDC is a GET)
-# Only the built-in platform allowlist keeps logs, artifacts, cache and OIDC working.
+#   run-actions-*-azure-*.actions.githubusercontent.com        { "*": NONE }
+# Only the built-in platform allowlist (7 endpoints on these hosts) keeps step logs, artifacts,
+# cache, OIDC and the job lease working.
 http_filter_platform() {
   local rec out code host
   rec=$(jq -c 'select(.ev=="start")' "$FLOWLOG" | tail -1)
-  jq -e '.http_filter_hosts == 3 and .platform_auto_allowed == 4' <<<"$rec" >/dev/null
-  pass_if HP.platform-loaded $? "proxy start record: $(jq -c '{http_filter_hosts, platform_auto_allowed}' <<<"$rec") (want 3 hosts, 4 platform endpoints)"
+  jq -e '.http_filter_hosts == 3 and .platform_auto_allowed == 7' <<<"$rec" >/dev/null
+  pass_if HP.platform-loaded $? "proxy start record: $(jq -c '{http_filter_hosts, platform_auto_allowed}' <<<"$rec") (want 3 hosts, 7 platform endpoints)"
 
   # OIDC token (GET */idtoken/*): allowed only by its platform entry. Never print the token.
   expect_passed HP.oidc-token "OIDC token request (GET ACTIONS_ID_TOKEN_REQUEST_URL)" \
@@ -617,7 +627,7 @@ http_filter_platform() {
     curl -sS -m 20 -f -o /dev/null -w '%{http_code}' -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=srt-http-filter"
   host=$(sed -E 's#^https://([^/]+)/.*#\1#' <<<"$ACTIONS_ID_TOKEN_REQUEST_URL")
   expect_blocked HP.oidc-host-filtered "GET https://$host/srt-probe (filter is live on the OIDC host)" \
-    ".host==\"$host\" and .path==\"/srt-probe\" and .verdict==\"BLOCK\" and .reason==\"method-not-allowed\"" \
+    ".host==\"$host\" and .path==\"/srt-probe\" and .verdict==\"BLOCK\" and .reason==\"path-not-allowed\"" \
     curl -sS -m 15 -o /dev/null -w '%{http_code}' "https://$host/srt-probe"
   expect_blocked HP.results-receiver-filtered "GET results-receiver /srt-probe (\"*\": NONE)" \
     '.host=="results-receiver.actions.githubusercontent.com" and .path=="/srt-probe" and .verdict=="BLOCK" and .reason=="path-not-allowed"' \
@@ -626,7 +636,7 @@ http_filter_platform() {
 
 # After artifact upload/download and cache save/restore ran under that filter.
 http_filter_platform_audit() {
-  local n refused host
+  local n refused host m want rec
   for want in 'results-receiver.actions.githubusercontent.com POST' 'blob.core.windows.net PUT' 'blob.core.windows.net GET'; do
     read -r host m <<<"$want"
     n=$(jq -c "select(.filter==\"platform\" and .method==\"$m\" and (.host|endswith(\"$host\")))" "$FLOWLOG" | wc -l)
@@ -642,7 +652,9 @@ http_filter_platform_audit() {
     | sed -E 's/[0-9a-f-]{16,}/*/g; s#/[0-9]+/#/N/#g' | sort | uniq -c | awk '{printf "%s %s %s(x%s); ", $2, $3, $4, $1}')
   [ -z "$refused" ]; pass_if HP.no-platform-refusals $? "platform requests refused by the filter: ${refused:-none}"
   render_report || return
-  report_has HP.report-platform '4 GitHub platform endpoints auto-allowed' "report shows the platform count"
+  rec=$(jq -r 'select((.host // "" | test("^run-actions-")) and .method=="POST") | "\(.path | sub("^/[0-9]+/"; "/N/")) \(.filter)"' "$FLOWLOG" | sort | uniq -c | tr '\n' ' ')
+  record HP.job-lease INFO "run-actions POSTs seen so far: ${rec:-none}"
+  report_has HP.report-platform '7 GitHub platform endpoints auto-allowed' "report shows the platform count"
 }
 
 # enforce job, allow-github-platform: false; productionresultssa*.blob.core.windows.net
