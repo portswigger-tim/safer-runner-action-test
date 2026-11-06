@@ -664,7 +664,8 @@ http_filter_split_audit() {
   n=$(jq -c 'select(.filter=="platform" and (.host|test("^run-actions-")) and (.path|endswith("/renewjob")))' "$FLOWLOG" | wc -l)
   [ "$n" -gt 0 ]; pass_if HS.renewjob-allowed $? "$n job-lease renewals allowed as essential platform"
   essential=$(jq -r '.http_filter.platform_auto_allowed // empty' /etc/safer-runner/policy.json 2>/dev/null)
-  if [ "$SPLIT" != receiver ]; then
+  # with results-receiver refused too, artifact and cache stop at their RPCs before any blob upload
+  if [ "$SPLIT" = blob ]; then
     rec=$(jq -c 'select(.verdict=="BLOCK" and (.host|test("^productionresultssa[0-9]+\\.blob")) and .method=="PUT" and (.path|test("/artifacts/")))' "$FLOWLOG" | head -1)
     [ -n "$rec" ]; pass_if HS.artifact-blob-refused $? "artifact blob upload refused by the job's NONE: ${rec:-<none>}"
     rec=$(jq -c 'select(.verdict=="BLOCK" and (.host|test("^productionresultssa[0-9]+\\.blob")) and (.path|startswith("/actions-cache/")))' "$FLOWLOG" | head -1)
@@ -812,14 +813,13 @@ http_filter_selftest() {
 # enforce + an invalid http-filter: setup must fail closed (no analyze fallback). The action step
 # has continue-on-error so this step can look; a real job stops there.
 http_filter_invalid() { # SR_OUTCOME: the action step's outcome
-  local job steps
   [ "${SR_OUTCOME:-}" = failure ]; pass_if HI.action-failed $? "action step outcome: ${SR_OUTCOME:-<unset>} (want failure)"
-  job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/${GITHUB_RUN_ATTEMPT:-1}/jobs?per_page=100" \
-        --jq ".jobs[] | select(.runner_name==\"$RUNNER_NAME\" and .status==\"in_progress\")" 2>/dev/null | head -1)
-  steps=$(jq -c '[.steps[] | select(.name|test("safer-runner-action")) | {name, conclusion}]' <<<"$job" 2>/dev/null)
-  jq -e 'map(select(.name|startswith("Pre "))) | length == 1 and .[0].conclusion == "failure"' <<<"$steps" >/dev/null 2>&1
-  pass_if HI.pre-failed $? "pre step failed: $steps"
+  # Nothing was installed in ANY mode: an analyze fallback would leave a marker, a policy and a
+  # running proxy writing a flow log. (The pre step's own conclusion can't show this: with
+  # continue-on-error a failed pre step is reported as success.)
   [ ! -e /etc/safer-runner/setup-complete ]; pass_if HI.no-setup-marker $? "no setup-complete marker (nothing was set up, in any mode)"
+  [ ! -e /etc/safer-runner/policy.json ] && [ ! -e "$FLOWLOG" ]
+  pass_if HI.no-policy $? "no policy.json and no flow log"
   ! systemctl is-active -q safer-runner-proxy 2>/dev/null; pass_if HI.no-proxy $? "safer-runner-proxy not running"
 }
 
