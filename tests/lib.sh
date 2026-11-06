@@ -5,9 +5,12 @@ FLOWLOG=/var/log/safer-runner/proxy-flows.jsonl
 ATTACKER_IP=1.1.1.1
 
 # record <id> <PASS|FAIL|INFO> <detail>
+# Newlines/tabs in the detail (e.g. a curl error followed by -w output) would split the TSV row
+# and the summary table, so they are flattened to spaces.
 record() {
-  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$RESULTS"
-  echo "[$2] $1 :: $3"
+  local detail=${3//[$'\n\r\t']/ }
+  printf '%s\t%s\t%s\n' "$1" "$2" "$detail" >> "$RESULTS"
+  echo "[$2] $1 :: $detail"
 }
 pass_if() { # pass_if <id> <condition-exit-code> <detail>
   if [ "$2" -eq 0 ]; then record "$1" PASS "$3"; else record "$1" FAIL "$3"; fi
