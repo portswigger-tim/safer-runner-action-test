@@ -97,3 +97,37 @@ expect_upstream_refused() {
   fi
 }
 
+
+# expect_passed <id> <desc> <jq-select-for-record> <cmd...>
+# PASS iff the proxy logged a matching record that is not a BLOCK and the response did not come
+# from the proxy's refusal (403 + x-safer-runner: blocked). For http-filter allow decisions.
+expect_passed() {
+  local id=$1 desc=$2 sel=$3; shift 3
+  local m out rc rec; m=$(mark)
+  out=$("$@" 2>&1); rc=$?
+  sleep 0.5
+  rec=$(flows_q "$m" "($sel) and .verdict != \"BLOCK\"" | head -1)
+  if [ -n "$rec" ] && ! grep -qi 'x-safer-runner: blocked' <<<"$out"; then
+    record "$id" PASS "$desc -> passed (rc=$rc out='${out: -60}'); $rec"
+  else
+    record "$id" FAIL "$desc -> rc=$rc out='${out: -120}'; proxy record: $(flows_q "$m" "$sel" | head -1)"
+  fi
+}
+
+# render_report: run the action's own post-step reporter now, with the job's inputs, into
+# $REPORT, so a step can assert on the summary the real post step will publish at job end.
+# (All it changes is deleting the CA key on disk early; the running proxy keeps it in memory.)
+render_report() {
+  local js
+  js=$(ls -d "$RUNNER_WORKSPACE"/../_actions/portswigger-tim/safer-runner-action/*/dist/post/index.js 2>/dev/null | head -1)
+  REPORT="${RUNNER_TEMP:-/tmp}/safer-runner-report.md"; : > "$REPORT"
+  [ -n "$js" ] || { record report.render FAIL "action post bundle not found under _actions"; return 1; }
+  env "INPUT_ALLOWED-DOMAINS=${ALLOWED:-}" "INPUT_PASSTHROUGH-DOMAINS=${PASSTHROUGH:-}" \
+    GITHUB_STEP_SUMMARY="$REPORT" node "$js" > "${REPORT%.md}.log" 2>&1
+  [ -s "$REPORT" ] || { record report.render FAIL "no report written: $(tail -3 "${REPORT%.md}.log")"; return 1; }
+}
+
+# report_has <id> <fixed-string> <desc>: PASS iff the rendered report contains the string
+report_has() {
+  grep -qF -- "$2" "$REPORT"; pass_if "$1" $? "$3 (report contains '$2')"
+}
