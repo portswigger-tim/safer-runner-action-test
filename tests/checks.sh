@@ -615,16 +615,20 @@ http_filter() {
 
 # Platform hosts the runner and first-party actions talk to.
 PLATFORM_HOSTS='^(results-receiver\\.actions\\.githubusercontent\\.com|productionresultssa[0-9]+\\.blob\\.core\\.windows\\.net|run-actions-.*\\.actions\\.githubusercontent\\.com)$'
-# The optional platform services (artifact, cache): a job's own rule wins over them.
-OPTIONAL_PATHS='(ArtifactService|CacheService)/|/artifacts/|^/actions-cache/'
+# Optional platform endpoints: a job's own rule wins over them. Under a job's NONE on these hosts
+# the job degrades but completes (validated on real runners): step status updates are refused
+# (invisible: the jobs API still shows every step), step logs are refused (the job log is lost),
+# artifact and cache fail.
+OPTIONAL_PATHS='(WorkflowStepUpdateService|ArtifactService|CacheService)/|/logs/|/artifacts/|^/actions-cache/'
 
 # Enforce jobs that filter platform hosts "*": NONE ($SPLIT says which; run-actions-*-azure-* is
 # always "*": NONE too):
 #   receiver: results-receiver.actions.githubusercontent.com
 #   blob:     productionresultssa*.blob.core.windows.net
 #   both:     both of them
-# The job's control plane (step logs and status, job lease and completion, OIDC) is essential
-# and stays allowed; artifact and cache are optional, so the job's NONE refuses them.
+# Essential (job lease and completion, OIDC, the step-log RPCs and live log stream) stays allowed;
+# the rest is optional, so the job's NONE refuses it and the job degrades but completes - the
+# verdict job in http-filter-platform-split.yml checks that each job closes without a hang.
 http_filter_split() {
   local host
   # the run-actions host is filtered in every config; the OIDC token (GET */idtoken/*) is
@@ -671,11 +675,20 @@ http_filter_split_audit() {
     rec=$(jq -c 'select(.verdict=="BLOCK" and (.host|test("^productionresultssa[0-9]+\\.blob")) and (.path|startswith("/actions-cache/")))' "$FLOWLOG" | head -1)
     [ -n "$rec" ]; pass_if HS.cache-blob-refused $? "cache blob upload refused by the job's NONE: ${rec:-<none>}"
   fi
-  # Anything refused on a platform host that is NOT artifact/cache (or our probe) is control
-  # plane the essential tier is missing.
+  # Only optional endpoints may be refused: anything else refused on a platform host (other than
+  # our probe) is essential control plane the built-in list is missing.
   refused=$(jq -r "select(.filter==\"block\" and (.host // \"\" | test(\"$PLATFORM_HOSTS\")) and ((.path // \"\") | test(\"srt-probe|$OPTIONAL_PATHS\") | not)) | \"\(.method) \(.host) \(.path)\"" "$FLOWLOG" \
     | sed -E 's/[0-9a-f-]{16,}/*/g; s#/[0-9]+/#/N/#g' | sort | uniq -c | awk '{printf "%s %s %s(x%s); ", $2, $3, $4, $1}')
-  [ -z "$refused" ]; pass_if HS.no-control-plane-refusals $? "control-plane requests refused: ${refused:-none}"
+  [ -z "$refused" ]; pass_if HS.only-optional-refused $? "essential requests refused: ${refused:-none}"
+  # the documented degradation, as expected refusals per config
+  if [ "$SPLIT" != blob ]; then
+    n=$(jq -c 'select(.filter=="block" and .host=="results-receiver.actions.githubusercontent.com" and (.path|test("WorkflowStepUpdateService/")))' "$FLOWLOG" | wc -l)
+    record HS.degraded-step-status INFO "$n step status updates refused (optional; the jobs API still shows each step's conclusion)"
+  fi
+  if [ "$SPLIT" != receiver ]; then
+    n=$(jq -c 'select(.filter=="block" and (.host|test("^productionresultssa[0-9]+\\.blob")) and (.path|test("/logs/")))' "$FLOWLOG" | wc -l)
+    [ "$n" -gt 0 ]; pass_if HS.degraded-step-logs $? "$n step-log uploads refused (optional: this job's own log is lost, the job still completes)"
+  fi
   # every refused platform request, as an annotation too (this job's own log upload may be refused)
   all=$(jq -r "select(.filter==\"block\" and (.host // \"\" | test(\"$PLATFORM_HOSTS\")) and ((.path // \"\") | test(\"srt-probe\") | not)) | \"\(.method) \(.host) \(.path)\"" "$FLOWLOG" \
     | sed -E 's/[0-9a-f-]{16,}/*/g; s#/[0-9]+/#/N/#g' | sort | uniq -c | awk '{printf "%s %s %s(x%s); ", $2, $3, $4, $1}')

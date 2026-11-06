@@ -1,14 +1,15 @@
-name: http-filter platform split (experiment)
+name: http-filter platform split
 
-# Which platform requests does a job need? Filter the platform hosts "*": NONE and see which
-# requests are refused and whether the job still completes. The run-actions host is always
-# "*": NONE too, so only the essential tier (logs/status, job lease + completion, OIDC) passes.
+# A job's NONE on the optional platform hosts degrades the job but never fails or hangs it. The
+# run-actions host is always "*": NONE too, so only the essential tier (job lease + completion,
+# OIDC, step-log RPCs, live log stream) passes there.
 #   receiver: results-receiver.actions.githubusercontent.com "*": NONE
 #   blob:     productionresultssa*.blob.core.windows.net "*": NONE
 #   both:     both
-# Artifact and cache are optional: the job's NONE must refuse them. Jobs are continue-on-error
-# (a degraded job is the data, not a suite failure); the verdict job reports each job's conclusion,
-# how long it took to close after its last step (a hang), and its annotations.
+# Expected (optional, refused): step status updates, step logs (blob: the job log is lost), artifact
+# and cache. Essential (allowed): everything else. The verdict job fails if any split job did not
+# succeed or took more than 60s to close after its last step (a refused completejob hangs a job
+# until its timeout).
 on:
   workflow_dispatch:
   pull_request:
@@ -32,7 +33,6 @@ jobs:
     name: split ${{ matrix.split }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -109,3 +109,7 @@ jobs:
               gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" --jq '.[] | "- \(.annotation_level): \(.title // "") \(.message | gsub("\n"; " ") | .[0:600])"'
             done
           } | tee -a "$GITHUB_STEP_SUMMARY"
+          bad=$(jq -r '.jobs[] | select(.name|startswith("split ")) |
+            (.steps | map(select(.completed_at != null and (.name|test("^(Post |Complete job)")|not))) | max_by(.number) | .completed_at) as $last |
+            select(.conclusion != "success" or ((.completed_at|fromdateiso8601) - ($last|fromdateiso8601)) > 60) | .name' <<<"$jobs")
+          if [ -n "$bad" ]; then echo "::error::split jobs that failed or hung: $(tr '\n' ',' <<<"$bad")"; exit 1; fi
