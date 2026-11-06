@@ -2,6 +2,12 @@ name: Test (ubuntu-26.04)
 
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        description: 'Run only this job, or all'
+        type: choice
+        default: all
+        options: [all, enforce, advisory, analyze, strict, crash, containers]
   push:
     branches:
       - main
@@ -12,9 +18,14 @@ on:
     # Weekly, to catch GitHub runner-image drift before consumers hit it.
     - cron: '17 6 * * 1'
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   suite:
     name: ubuntu-26.04
     uses: ./.github/workflows/suite.yml
     with:
       os: ubuntu-26.04
+      only: ${{ inputs.only || 'all' }}

@@ -1,7 +1,9 @@
 name: Test suite (reusable, per-OS)
 
-# Reusable: every scenario job for ONE OS. test.yml calls this once per OS so
-# the Actions UI groups by OS instead of by test.
+# Reusable: every safer-runner-action@main scenario for ONE runner image. Each test-<os>.yml
+# calls this once so the Actions UI groups by OS instead of by test. Must-pass, must-fail and
+# survival checks live in tests/; results land in each job's step summary and any FAIL fails
+# the job. Supply-chain attack replays are separate: attack-replay.yml.
 on:
   workflow_call:
     inputs:
@@ -9,986 +11,358 @@ on:
         description: 'Runner image to run the whole suite on'
         required: true
         type: string
+      only:
+        description: 'Run only this job (enforce|advisory|analyze|strict|crash|containers), or all'
+        required: false
+        type: string
+        default: 'all'
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # nip.io / sslip.io: public wildcard DNS (169.254.169.254.nip.io -> 169.254.169.254), used to
+  # prove allowlisted names that resolve to internal addresses are refused (review H1).
+  # Exact by default: a bare name is that name only; *.x = subdomains; .x = both.
+  ALLOWED: >-
+    registry.npmjs.org pypi.org files.pythonhosted.org
+    .docker.io .docker.com
+    *.nip.io *.sslip.io
+  PASSTHROUGH: 100-64-0-1.sslip.io pt-hosts.sslip.io
+  # authenticated api.github.com calls (the unauthenticated per-IP limit returns 403 on shared runner IPs)
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
-  test-analyze-mode:
-    name: Test Analyze Mode
+  enforce:
+    if: ${{ inputs.only == 'all' || inputs.only == 'enforce' }}
+    name: enforce
     runs-on: ${{ inputs.os }}
+    timeout-minutes: 25
     steps:
-      - name: Debug runner user information
-        run: |
-          echo "=== Runner User Information ==="
-          echo "Current user:"
-          whoami
-          echo ""
-          echo "User ID:"
-          id
-          echo ""
-          echo "Groups:"
-          groups
-          echo ""
-          echo "Detailed group membership:"
-          id -Gn
-          echo ""
-          echo "Sudo test (should work before action):"
-          sudo echo "Sudo is working"
-
-      - name: Apply Safer Runner Action (Analyze Mode)
+      # Default enforce removes sudo (disable-sudo unset = on in enforce, H2)
+      - name: safer-runner (enforce, defaults)
         uses: portswigger-tim/safer-runner-action@main
         with:
-          mode: 'analyze'
-          allowed-domains: 'httpbin.org api.github.com'
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
 
-      - name: Output sudoers configuration
-        run: |
-          echo "=== Sudoers Configuration ==="
-          echo "Main sudoers file:"
-          sudo cat /etc/sudoers
-          echo ""
-          echo "Sudoers.d directory contents:"
-          sudo ls -la /etc/sudoers.d/
-          echo ""
-          echo "Individual sudoers.d files:"
-          for file in /etc/sudoers.d/*; do
-            if [ -f "$file" ]; then
-              echo "--- $file ---"
-              sudo cat "$file"
-              echo ""
-            fi
-          done
-
-          echo ""
-          echo "=== Runner Sudoers File Content ==="
-          sudo cat /etc/sudoers.d/runner
-
-      - name: Check DNS log file permissions
-        run: |
-          echo "=== DNS Log File Permissions ==="
-          echo "Pre-hook DNS log:"
-          ls -l /var/log/safer-runner/pre-dns.log || echo "Pre-hook DNS log not found"
-          echo ""
-          echo "Main action DNS log:"
-          ls -l /var/log/safer-runner/main-dns.log || echo "Main action DNS log not found"
-
-      - name: Test GitHub domain access
-        run: |
-          echo "Testing GitHub domain access..."
-          curl -I https://api.github.com/user || { echo "GitHub API failed"; exit 1; }
-          curl -I https://github.com || { echo "GitHub main failed"; exit 1; }
-      
-      - name: Test custom allowed domain
-        run: |
-          echo "Testing custom allowed domain..."
-          curl -I https://httpbin.org/get || { echo "Custom domain failed"; exit 1; }
-
-      - name: Test sudo commands for configuration advice
-        run: |
-          echo "Testing sudo commands (to generate configuration advice)..."
-          sudo docker --version
-          sudo whoami
-          sudo cat /etc/os-release
-
-      - name: Test localhost DNS resolution
-        run: |
-          echo "Testing localhost DNS resolution in analyze mode..."
-          timeout 2 dig localhost || { echo "Localhost DNS resolution failed"; exit 1; }
-      
-      - name: Test unauthorized domain (should be logged but allowed)
-        run: |
-          echo "Testing unauthorized domain in analyze mode..."
-          curl -I https://example.com || { echo "Example.com failed"; exit 1; }
-      
-      - name: Check logs
-        run: |
-          echo "=== rsyslog Configuration ==="
-          echo "Checking if rsyslog configs exist:"
-          ls -la /etc/rsyslog.d/10-iptables-safer-runner-*.conf 2>/dev/null || echo "rsyslog configs not found"
-          if [ -f /etc/rsyslog.d/10-iptables-safer-runner-pre.conf ]; then
-            echo "Pre-hook rsyslog config contents:"
-            sudo cat /etc/rsyslog.d/10-iptables-safer-runner-pre.conf
-          fi
-          if [ -f /etc/rsyslog.d/10-iptables-safer-runner-main.conf ]; then
-            echo "Main action rsyslog config contents:"
-            sudo cat /etc/rsyslog.d/10-iptables-safer-runner-main.conf
-          fi
-
-          echo ""
-          echo "=== rsyslog Service Status ==="
-          sudo systemctl status rsyslog --no-pager || true
-
-          echo ""
-          echo "=== rsyslog Error Logs ==="
-          sudo journalctl -u rsyslog -n 50 --no-pager || true
-
-          echo ""
-          echo "=== Test rsyslog Filtering ==="
-          echo "Testing if rsyslog would match our patterns:"
-          sudo grep -E "(Main-GitHub-Allow:|Main-User-Allow:|Main-Drop-Enforce:|Main-Allow-Analyze:)" /var/log/syslog | head -5 || echo "No matching patterns in syslog"
-
-          echo ""
-          echo "=== iptables Log File Permissions ==="
-          echo "Pre-hook iptables log:"
-          ls -la /var/log/safer-runner/pre-iptables.log 2>/dev/null || echo "Pre-hook iptables log not found"
-          echo "Main action iptables log:"
-          ls -la /var/log/safer-runner/main-iptables.log 2>/dev/null || echo "Main action iptables log not found"
-
-          echo ""
-          echo "=== Pre-hook Network Logs (from dedicated file) ==="
-          if [ -f /var/log/safer-runner/pre-iptables.log ]; then
-            echo "Pre-hook iptables log file found ($(wc -l < /var/log/safer-runner/pre-iptables.log) lines):"
-            cat /var/log/safer-runner/pre-iptables.log | head -30
-          else
-            echo "Pre-hook iptables log file not found at /var/log/safer-runner/pre-iptables.log"
-            echo "Checking syslog fallback:"
-            sudo grep -E 'Pre-GitHub-Allow: |Pre-User-Allow: |Pre-Allow-Analyze: ' /var/log/syslog | tail -20 || echo "No Pre- logs in syslog either"
-          fi
-
-          echo ""
-          echo "=== Main Action Network Logs (from dedicated file) ==="
-          if [ -f /var/log/safer-runner/main-iptables.log ]; then
-            echo "Main action iptables log file found ($(wc -l < /var/log/safer-runner/main-iptables.log) lines):"
-            cat /var/log/safer-runner/main-iptables.log | head -30
-          else
-            echo "Main action iptables log file not found at /var/log/safer-runner/main-iptables.log"
-            echo "Checking syslog fallback:"
-            sudo grep -E 'Main-GitHub-Allow: |Main-User-Allow: |Main-Allow-Analyze: |Main-Drop-Enforce: ' /var/log/syslog | tail -20 || echo "No Main- logs in syslog either"
-          fi
-
-          echo ""
-          echo "=== Raw syslog iptables entries (all prefixes) ==="
-          sudo grep -E 'Pre-|Main-' /var/log/syslog | grep -E 'GitHub-Allow:|User-Allow:|Allow-Analyze:|Drop-Enforce:' | tail -30 || echo "No iptables logs in syslog"
-
-          echo ""
-          echo "=== Pre-hook DNS Logs ==="
-          if [ -f /var/log/safer-runner/pre-dns.log ]; then
-            echo "Pre-hook DNS logs file found:"
-            grep -E 'query\[A\]|reply|NXDOMAIN' /var/log/safer-runner/pre-dns.log | tail -30 || echo "Could not read pre-hook DNS logs"
-          else
-            echo "Pre-hook DNS logs file not found at /var/log/safer-runner/pre-dns.log"
-          fi
-
-          echo ""
-          echo "=== Main Action DNS Logs ==="
-          if [ -f /var/log/safer-runner/main-dns.log ]; then
-            echo "Main action DNS logs file found:"
-            grep -E 'query\[A\]|reply|NXDOMAIN' /var/log/safer-runner/main-dns.log | tail -30 || echo "Could not read main action DNS logs"
-          else
-            echo "Main action DNS logs file not found at /var/log/safer-runner/main-dns.log"
-          fi
-
-          echo ""
-          echo "=== Sudo Usage Logs ==="
-          echo "Pre-hook sudo log file:"
-          ls -lh /var/log/safer-runner/pre-sudo.log 2>/dev/null || echo "Pre-hook sudo log file not found"
-          if [ -f /var/log/safer-runner/pre-sudo.log ]; then
-            echo "Pre-hook sudo log contents (last 20 lines):"
-            tail -20 /var/log/safer-runner/pre-sudo.log 2>/dev/null || echo "Could not read pre-hook sudo log"
-          fi
-          echo ""
-          echo "Main action sudo log file:"
-          ls -lh /var/log/safer-runner/main-sudo.log 2>/dev/null || echo "Main action sudo log file not found"
-          if [ -f /var/log/safer-runner/main-sudo.log ]; then
-            echo "Main action sudo log contents (last 20 lines):"
-            tail -20 /var/log/safer-runner/main-sudo.log 2>/dev/null || echo "Could not read main action sudo log"
-            echo ""
-            echo "Count of sudo commands in main log:"
-            wc -l /var/log/safer-runner/main-sudo.log 2>/dev/null || echo "Could not count sudo commands"
-          fi
-
-      - name: Verify job summary was created
-        run: |
-          echo "✅ Job summary should be automatically generated by post-action"
-          echo "📊 Check the job summary section below for Network Access Provenance table"
-
-  test-enforce-mode:
-    name: Test Enforce Mode
-    runs-on: ${{ inputs.os }}
-    steps:
-      - name: Apply Safer Runner Action (Enforce Mode)
-        uses: portswigger-tim/safer-runner-action@main
-        with:
-          mode: 'enforce'
-          allowed-domains: 'httpbin.org'
-      
-      - name: Test GitHub domain access (should work)
-        run: |
-          echo "Testing GitHub domain access in enforce mode..."
-          curl -I https://api.github.com/user || { echo "GitHub API blocked (unexpected)"; exit 1; }
-          curl -I https://github.com || { echo "GitHub main blocked (unexpected)"; exit 1; }
-      
-      - name: Test custom allowed domain (should work)
-        run: |
-          echo "Testing custom allowed domain..."
-          curl -I https://httpbin.org/get || { echo "Custom domain blocked (unexpected)"; exit 1; }
-      
-      - name: Test localhost DNS resolution
-        run: |
-          echo "Testing localhost DNS resolution in enforce mode..."
-          timeout 2 dig localhost || { echo "Localhost DNS resolution failed"; exit 1; }
-      
-      - name: Test unauthorized domain (should be blocked)
-        run: |
-          echo "Testing unauthorized domain in enforce mode..."
-          timeout 10 curl -I https://example.com && echo "ERROR: Unauthorized domain was allowed!" || echo "SUCCESS: Unauthorized domain blocked as expected"
-      
-      - name: Test malicious domain blocking (should be blocked)  
-        run: |
-          echo "Testing malicious domain blocking..."
-          timeout 10 curl -I https://malicious-test-domain.com && echo "ERROR: Malicious domain was allowed!" || echo "SUCCESS: Malicious domain blocked as expected"
-      
-      - name: Check security logs
-        run: |
-          echo "=== Pre-hook Network Logs ==="
-          sudo grep -E 'Pre-GitHub-Allow: |Pre-User-Allow: |Pre-Allow-Analyze: ' /var/log/syslog | tail -20 || echo "No Pre- logs found"
-
-          echo ""
-          echo "=== Main Action Network Logs ==="
-          sudo grep -E 'Main-GitHub-Allow: |Main-User-Allow: |Main-Drop-Enforce: ' /var/log/syslog | tail -30 || echo "No main action logs found"
-
-          echo ""
-          echo "=== Pre-hook DNS Logs ==="
-          if [ -f /var/log/safer-runner/pre-dns.log ]; then
-            echo "Pre-hook DNS logs file found:"
-            grep -E 'query\[A\]|reply|NXDOMAIN' /var/log/safer-runner/pre-dns.log | tail -30 || echo "Could not read pre-hook DNS logs"
-          else
-            echo "Pre-hook DNS logs file not found at /var/log/safer-runner/pre-dns.log"
-          fi
-
-          echo ""
-          echo "=== Main Action DNS Logs ==="
-          if [ -f /var/log/safer-runner/main-dns.log ]; then
-            echo "Main action DNS logs file found:"
-            grep -E 'query\[A\]|reply|NXDOMAIN' /var/log/safer-runner/main-dns.log | tail -30 || echo "Could not read main action DNS logs"
-          else
-            echo "Main action DNS logs file not found at /var/log/safer-runner/main-dns.log"
-          fi
-
-      - name: Verify job summary was created
-        run: |
-          echo "✅ Job summary should be automatically generated by post-action"
-          echo "📊 Check the job summary section below for Network Access Provenance table"
-          echo "🔒 Should show blocked connections in enforce mode"
-
-  test-github-actions-compatibility:
-    name: Test GitHub Actions Compatibility
-    runs-on: ${{ inputs.os }}
-    steps:
-      - name: Apply Safer Runner Action (Enforce Mode)
-        uses: portswigger-tim/safer-runner-action@main
-        with:
-          mode: 'enforce'
-
-      - name: Test Actions checkout (uses GitHub domains)
+      - name: checkout (through the proxy - agent survival)
         uses: actions/checkout@v7
+
+      - name: must-pass
+        run: tests/checks.sh must-pass || true
+
+      - name: must-fail
+        run: tests/checks.sh must-fail || true
+
+      - name: SSRF - allowlisted names resolving to internal addresses (H1)
+        run: tests/checks.sh ssrf || true
+
+      - name: default enforce removed sudo (H2)
+        run: tests/checks.sh privilege-removed || true
+
+      - name: prepare artifact / cache payload
+        run: |
+          mkdir -p art cache-dir
+          head -c 20000000 /dev/urandom > art/payload.bin
+          sha256sum art/payload.bin | cut -d' ' -f1 > art.sha256
+          cp art/payload.bin cache-dir/
+      - uses: actions/upload-artifact@v7
         with:
-          repository: actions/hello-world-javascript-action
-          path: test-repo
-
-      - name: Test artifact upload/download
-        uses: actions/upload-artifact@v7
+          name: enforce-${{ inputs.os }}
+          path: art/payload.bin
+          retention-days: 1
+      - uses: actions/download-artifact@v8
         with:
-          name: test-artifact
-          path: test-repo/README.md
-
-      - name: Download test artifact
-        uses: actions/download-artifact@v8
+          name: enforce-${{ inputs.os }}
+          path: dl
+      - uses: actions/cache/save@v6
         with:
-          name: test-artifact
-          path: downloaded/
-
-      - name: Verify artifact was downloaded
-        run: |
-          ls -la downloaded/
-          cat downloaded/README.md | head -5
-      
-      - name: Check GitHub Actions logs
-        run: |
-          echo "=== Pre-hook Network Logs ==="
-          sudo grep -E 'Pre-GitHub-Allow: |Pre-User-Allow: ' /var/log/syslog | tail -15 || echo "No Pre- logs found"
-
-          echo ""
-          echo "=== Main Action GitHub Domain Access Logs ==="
-          sudo grep -E 'Main-GitHub-Allow: ' /var/log/syslog | tail -20 || echo "No GitHub domain access logs found"
-
-          echo ""
-          echo "=== Pre-hook DNS Logs ==="
-          if [ -f /var/log/safer-runner/pre-dns.log ]; then
-            grep -E 'query\[A\]|reply|NXDOMAIN' /var/log/safer-runner/pre-dns.log | tail -20 || echo "Could not read pre-hook DNS logs"
-          else
-            echo "Pre-hook DNS logs file not found at /var/log/safer-runner/pre-dns.log"
-          fi
-
-          echo ""
-          echo "=== Main Action DNS Logs ==="
-          if [ -f /var/log/safer-runner/main-dns.log ]; then
-            grep -E 'query\[A\]|reply|NXDOMAIN' /var/log/safer-runner/main-dns.log | tail -20 || echo "Could not read main action DNS logs"
-          else
-            echo "Main action DNS logs file not found at /var/log/safer-runner/main-dns.log"
-          fi
-
-  test-edge-cases:
-    name: Test Edge Cases
-    runs-on: ${{ inputs.os }}
-    services:
-      nginx:
-        image: nginx:alpine
-        ports:
-          - 80/tcp
-        options: --restart always
-    steps:
-      - name: Apply Safer Runner Action (Enforce Mode)
-        uses: portswigger-tim/safer-runner-action@main
+          path: cache-dir
+          key: suite-${{ github.run_id }}-${{ github.run_attempt }}-enforce-${{ inputs.os }}
+      - name: wait for cache consistency (GitHub lag, seen without a proxy too)
+        run: sleep 10
+      - uses: actions/cache/restore@v6
+        id: restore
         with:
-          mode: 'enforce'
-          allowed-domains: 'api.github.com httpbin.org'
+          path: cache-dir
+          key: suite-${{ github.run_id }}-${{ github.run_attempt }}-enforce-${{ inputs.os }}
+          fail-on-cache-miss: true
 
-      - name: Test DNS resolution
-        run: |
-          echo "Testing DNS resolution..."
-          dig api.github.com || echo "DNS resolution failed"
-          dig httpbin.org || echo "Custom DNS resolution failed"
-      
-      - name: Test multiple protocols
-        run: |
-          echo "Testing HTTPS..."
-          curl -I https://api.github.com || echo "HTTPS failed"
-          
-          echo "Testing HTTP (if allowed)..."
-          curl -I http://httpbin.org/get || echo "HTTP failed (expected in enforce mode)"
-      
-      - name: Test localhost access
-        run: |
-          echo "Testing localhost DNS resolution..."
-          timeout 5 dig localhost || { echo "Localhost DNS resolution failed"; exit 1; }
-
-          echo "Testing localhost access to nginx service..."
-          timeout 5 curl -I http://127.0.0.1:${{ job.services.nginx.ports['80'] }} || { echo "Localhost nginx failed"; exit 1; }
-
-          echo "Testing localhost access to different port (should fail)..."
-          timeout 5 curl -I http://127.0.0.1:9999 && echo "ERROR: Unexpected service responded!" || echo "SUCCESS: No service on port 9999 as expected"
-
-      - name: Test direct IP address blocking
-        run: |
-          echo "Testing direct IP address communication blocking..."
-
-          # Direct-IP DNS is informational only: on GitHub's experimental egress-resolver
-          # VMs (westus2, actions/runner-images#14925) a :53 query to an external IP is
-          # NAT'd to the local egress resolver before our rules see it, so it can be
-          # answered. Our loopback-redirect forces @127.0.0.x resolvers through dnsmasq;
-          # this external-IP case is a documented residual, so we warn rather than fail.
-          echo "Testing DNS query to Google DNS server 8.8.8.8 (informational)..."
-          if timeout 1 dig @8.8.8.8 google.com +short | grep -qE '^[0-9]'; then
-            echo "::warning::Direct-IP DNS to 8.8.8.8 was answered (likely a GitHub egress-resolver VM; see runner-images#14925)"
-          else
-            echo "SUCCESS: Direct IP DNS query blocked as expected"
-          fi
-
-          # The IP-layer firewall (HTTP/HTTPS to a raw IP) is a hard requirement.
-          echo "Testing HTTP request to direct IP address (should be blocked)..."
-          timeout 1 curl -I http://8.8.8.8 && { echo "ERROR: Direct IP HTTP request was allowed!"; exit 1; } || echo "SUCCESS: Direct IP HTTP request blocked as expected"
-
-          echo "Testing HTTPS request to direct IP address (should be blocked)..."
-          timeout 1 curl -I https://1.1.1.1 && { echo "ERROR: Direct IP HTTPS request was allowed!"; exit 1; } || echo "SUCCESS: Direct IP HTTPS request blocked as expected"
-      
-      - name: Check localhost test logs
+      - name: results
         if: always()
         run: |
-          echo "=== Pre-hook Network Logs ==="
-          sudo grep -E 'Pre-GitHub-Allow: |Pre-User-Allow: |Pre-Allow-Analyze: ' /var/log/syslog | tail -15 || echo "No Pre- logs found"
+          source tests/lib.sh
+          [ "$(sha256sum dl/payload.bin | cut -d' ' -f1)" = "$(cat art.sha256)" ]
+          pass_if R.artifact-roundtrip $? "20MB upload-artifact -> download-artifact sha256"
+          [ "${{ steps.restore.outcome }}" = success ]; pass_if R.cache-roundtrip $? "cache save -> restore: ${{ steps.restore.outcome }}"
+          finish "enforce / ${{ inputs.os }}"
 
-          echo ""
-          echo "=== Main Action Network Logs ==="
-          sudo grep -E 'Main-GitHub-Allow: |Main-User-Allow: |Main-Drop-Enforce: |Main-Allow-Analyze: ' /var/log/syslog | tail -30 || echo "No main action logs found"
-
-          echo ""
-          echo "=== Pre-hook DNS Logs ==="
-          if [ -f /var/log/safer-runner/pre-dns.log ]; then
-            grep -E 'query\[A\]|reply|NXDOMAIN' /var/log/safer-runner/pre-dns.log | tail -20 || echo "Could not read pre-hook DNS logs"
-          else
-            echo "Pre-hook DNS logs file not found at /var/log/safer-runner/pre-dns.log"
-          fi
-
-          echo ""
-          echo "=== Main Action DNS Logs ==="
-          if [ -f /var/log/safer-runner/main-dns.log ]; then
-            grep -E 'query\[A\]|reply|NXDOMAIN' /var/log/safer-runner/main-dns.log | tail -20 || echo "Could not read main action DNS logs"
-          else
-            echo "Main action DNS logs file not found at /var/log/safer-runner/main-dns.log"
-          fi
-
-      - name: Final security audit
-        run: |
-          echo "=== Final Security Audit ==="
-          echo "Network Interfaces:"
-          ip link show
-
-          echo "Routing Table:"
-          ip route show
-
-          echo "Default Gateway Interface:"
-          ip route get 8.8.8.8 | grep dev
-
-          echo "IPTables rules:"
-          sudo iptables -L OUTPUT -n -v | head -20
-
-          echo "Active IPSets:"
-          sudo ipset list github | head -10 || echo "GitHub ipset empty"
-          sudo ipset list user | head -10 || echo "User ipset empty"
-
-          echo "DNS Configuration:"
-          cat /etc/resolv.conf
-
-          echo "DNSMasq status:"
-          sudo systemctl status dnsmasq --no-pager -l
-
-  test-system-integrity:
-    name: Test System Integrity Validation
-    runs-on: ${{ inputs.os }}
-    steps:
-      - name: Apply Safer Runner Action (Analyze Mode)
-        uses: portswigger-tim/safer-runner-action@main
-        with:
-          mode: 'analyze'
-          allowed-domains: 'httpbin.org'
-     
-
-      - name: Verify baseline was captured
-        run: |
-          echo "=== Verifying baseline capture ==="
-          if [ -f /tmp/safer-runner-validation-state.json ]; then
-            echo "✅ Baseline file exists"
-            echo "📋 Baseline contents:"
-            sudo cat /tmp/safer-runner-validation-state.json | jq '.' || echo "Not valid JSON"
-          else
-            echo "❌ ERROR: Baseline file not found!"
-            exit 1
-          fi
-
-      - name: Test normal operation (no tampering)
-        run: |
-          echo "=== Testing normal operation ==="
-          echo "Making allowed network requests..."
-          curl -I https://api.github.com || echo "GitHub API request failed"
-          curl -I https://httpbin.org/get || echo "Custom domain request failed"
-
-      - name: Verify system files exist
-        run: |
-          echo "=== Verifying critical system files ==="
-          echo "Checking /etc/dnsmasq.conf..."
-          if [ -f /etc/dnsmasq.conf ]; then
-            echo "✅ dnsmasq.conf exists"
-            echo "First 10 lines:"
-            sudo head -10 /etc/dnsmasq.conf
-          else
-            echo "❌ ERROR: dnsmasq.conf missing!"
-            exit 1
-          fi
-
-          echo "Checking /etc/resolv.conf..."
-          if [ -f /etc/resolv.conf ]; then
-            echo "✅ resolv.conf exists"
-            cat /etc/resolv.conf
-          else
-            echo "❌ ERROR: resolv.conf missing!"
-            exit 1
-          fi
-
-          echo "Checking systemd resolved config..."
-          if [ -f /etc/systemd/resolved.conf.d/no-stub.conf ]; then
-            echo "✅ no-stub.conf exists"
-            sudo cat /etc/systemd/resolved.conf.d/no-stub.conf
-          else
-            echo "❌ ERROR: no-stub.conf missing!"
-            exit 1
-          fi
-
-      - name: Test tampering detection (simulate file modification)
-        run: |
-          echo "=== Testing tampering detection ==="
-
-          # Get original checksum for comparison
-          echo "Original dnsmasq.conf checksum:"
-          sudo sha256sum /etc/dnsmasq.conf
-
-          # Simulate tampering by appending to dnsmasq.conf
-          echo "# MALICIOUS MODIFICATION FOR TESTING" | sudo tee -a /etc/dnsmasq.conf
-
-          echo "Modified dnsmasq.conf checksum:"
-          sudo sha256sum /etc/dnsmasq.conf
-
-          echo "File was tampered with - post-action should detect this!"
-
-      - name: Check system logs for validation activity
+      - name: evidence
         if: always()
         run: |
-          echo "=== System Integrity Validation Logs ==="
-          sudo grep -E 'Capturing|Verifying|integrity|baseline|checksum' /var/log/syslog | tail -20 || echo "No validation logs found in syslog"
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          sudo journalctl -u safer-runner-proxy --no-pager > evidence/proxy-journal.txt 2>&1 || true
+          sudo iptables-save > evidence/iptables-save.txt 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-enforce-${{ inputs.os }}
+          path: evidence/
+          retention-days: 7
 
-          echo "=== Application Logs ==="
-          # Look for our validation messages in GitHub Actions logs
-          echo "Validation should appear in the action output above"
-
-      - name: Final validation test
-        run: |
-          echo "=== Final validation summary ==="
-          echo "✅ Baseline capture: Should be completed during action setup"
-          echo "🔍 Tampering detection: Intentionally modified dnsmasq.conf"
-          echo "📊 Validation report: Should show tampering in job summary"
-          echo "🚨 Expected result: Post-action should detect and report tampering"
-          echo ""
-          echo "Check the job summary below for the System Integrity Validation Report!"
-          echo "It should show ❌ Tampered status for /etc/dnsmasq.conf"
-
-  test-disable-sudo:
-    name: Test Disable Sudo Feature
+  advisory:
+    if: ${{ inputs.only == 'all' || inputs.only == 'advisory' }}
+    name: enforce+disable-sudo:false (ADVISORY)
     runs-on: ${{ inputs.os }}
+    timeout-minutes: 25
     steps:
-      - name: Verify sudo works before action
-        run: |
-          echo "=== Testing sudo BEFORE disabling ==="
-          whoami
-          sudo whoami
-          echo "✅ Sudo is working"
-
-      - name: Apply Safer Runner Action with disable-sudo
+      # Explicit opt-out: sudo kept, job labelled "enforce (ADVISORY - sudo retained)" (H2)
+      - name: safer-runner (enforce, sudo retained)
         uses: portswigger-tim/safer-runner-action@main
         with:
-          mode: 'analyze'
-          disable-sudo: 'true'
-
-      - name: Verify sudo is disabled after action
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
+          disable-sudo: false
+      - uses: actions/checkout@v7
+      - name: advisory label + sudo kept (H2)
+        run: tests/checks.sh privilege-retained || true
+      - name: must-fail
+        run: tests/checks.sh must-fail || true
+      - name: SSRF (H1)
+        run: tests/checks.sh ssrf || true
+      - name: sudo-dependent must-fail (REDIRECT hole, proxy-side IP guard via /etc/hosts, proxy kill)
+        run: tests/checks.sh sudo-must-fail || true
+      - name: results
+        if: always()
+        run: source tests/lib.sh && finish "advisory / ${{ inputs.os }}"
+      - name: evidence
+        if: always()
         run: |
-          echo "=== Testing sudo AFTER disabling ==="
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          sudo journalctl -u safer-runner-proxy --no-pager > evidence/proxy-journal.txt 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-advisory-${{ inputs.os }}
+          path: evidence/
+          retention-days: 7
 
-          echo "Attempting to run sudo command (should fail)..."
-          if sudo whoami 2>&1; then
-            echo "❌ ERROR: Sudo still works! It should have been disabled."
-            exit 1
-          else
-            echo "✅ SUCCESS: Sudo is correctly disabled"
-          fi
-
-      - name: Verify Docker still works
-        run: |
-          echo "=== Testing Docker access (should still work) ==="
-          docker --version
-          docker ps
-          curl -I https://google.com
-          echo "✅ Docker access still works (runner user still in docker group)"
-
-      - name: Verify log file access still works
-        run: |
-          echo "=== Testing log file access (should still work) ==="
-          # Runner user is in 'adm' group, should be able to read some logs
-          ls -la /var/log/syslog
-          echo "✅ Log file access still works (runner user still in adm group)"
-
-  test-sudo-config:
-    name: Test Custom Sudo Config
+  analyze:
+    if: ${{ inputs.only == 'all' || inputs.only == 'analyze' }}
+    name: analyze
     runs-on: ${{ inputs.os }}
+    timeout-minutes: 25
     steps:
-      - name: Verify sudo works before action
-        run: |
-          echo "=== Testing sudo BEFORE restricting ==="
-          sudo whoami
-          sudo docker --version
-          sudo npm --version
-          echo "✅ Sudo is unrestricted"
-
-      - name: Debug executable paths
-        run: |
-          echo "=== Finding executable paths ==="
-          echo "docker: $(which docker)"
-          echo "npm: $(which npm)"
-          echo "whoami: $(which whoami)"
-          echo "grep: $(which grep)"
-          echo "cat: $(which cat)"
-          echo "iptables: $(which iptables)"
-
-      - name: Apply Safer Runner Action with custom sudo-config
+      - name: safer-runner (analyze)
         uses: portswigger-tim/safer-runner-action@main
         with:
-          mode: 'analyze'
-          sudo-config: |
-            runner ALL=(ALL) NOPASSWD: /usr/bin/docker
-            runner ALL=(ALL) NOPASSWD: /usr/local/bin/npm
-
-      - name: Debug sudoers file after action
+          mode: analyze
+      - uses: actions/checkout@v7
+      - name: must-pass
+        run: tests/checks.sh must-pass || true
+      - name: analyze behaviour
+        run: tests/checks.sh analyze || true
+      - name: artifact payload
+        run: mkdir -p art && head -c 5000000 /dev/urandom > art/payload.bin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: analyze-${{ inputs.os }}
+          path: art/payload.bin
+          retention-days: 1
+      - name: results
+        if: always()
+        run: source tests/lib.sh && finish "analyze / ${{ inputs.os }}"
+      - name: evidence
+        if: always()
         run: |
-          echo "=== Checking sudoers configuration ==="
-          sudo cat /etc/sudoers.d/runner || echo "File not found"
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          echo "=== non-proxied egress (what enforce's filter would reject)"; cat /var/log/safer-runner/firewall.log || true
+          sudo ss -tunap > evidence/ss.txt 2>&1 || true
+          ps -eo user,uid,pid,args > evidence/ps.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-analyze-${{ inputs.os }}
+          path: evidence/
+          retention-days: 7
 
-      - name: Verify restricted sudo commands work
-        run: |
-          echo "=== Testing allowed sudo commands ==="
-
-          echo "Testing sudo docker (should work)..."
-          sudo docker --version || { echo "❌ ERROR: sudo docker failed!"; exit 1; }
-          echo "✅ sudo docker works"
-
-          echo "Testing sudo npm (should work)..."
-          sudo npm --version || { echo "❌ ERROR: sudo npm failed!"; exit 1; }
-          echo "✅ sudo npm works"
-
-      - name: Verify non-allowed sudo commands fail
-        run: |
-          echo "=== Testing non-allowed sudo commands ==="
-
-          echo "Testing sudo whoami (should fail)..."
-          if sudo whoami 2>&1; then
-            echo "❌ ERROR: sudo whoami should have been blocked!"
-            exit 1
-          else
-            echo "✅ sudo whoami correctly blocked"
-          fi
-
-          echo "Testing sudo ls (should fail)..."
-          if sudo ls /root 2>&1; then
-            echo "❌ ERROR: sudo ls should have been blocked!"
-            exit 1
-          else
-            echo "✅ sudo ls correctly blocked"
-          fi
-
-      - name: Verify Docker and other group access still works
-        run: |
-          echo "=== Testing non-sudo group access ==="
-          docker --version
-          docker ps
-          echo "✅ Docker access works without sudo (via docker group)"
-
-  test-disable-docker:
-    name: Test Disable Docker Feature
+  strict:
+    if: ${{ inputs.only == 'all' || inputs.only == 'strict' }}
+    name: enforce+disable-sudo+docker:remove-group
     runs-on: ${{ inputs.os }}
+    timeout-minutes: 25
     steps:
-      - name: Verify Docker works before action
-        run: |
-          echo "=== Testing Docker BEFORE disabling ==="
-          whoami
-          groups
-          docker --version
-          docker ps
-          echo "✅ Docker is working"
-
-      - name: Apply Safer Runner Action with disable-docker
+      - name: safer-runner (enforce, strict privilege layer)
         uses: portswigger-tim/safer-runner-action@main
         with:
-          mode: 'analyze'
-          disable-docker: 'true'
+          mode: enforce
+          disable-sudo: true
+          docker: remove-group
+          fail-on-tampering: true
+      - uses: actions/checkout@v7
+      - name: strict checks
+        run: tests/checks.sh strict || true
+      - name: artifact payload
+        run: mkdir -p art && head -c 5000000 /dev/urandom > art/payload.bin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: strict-${{ inputs.os }}
+          path: art/payload.bin
+          retention-days: 1
+      - uses: actions/cache/save@v6
+        with:
+          path: art
+          key: suite-${{ github.run_id }}-${{ github.run_attempt }}-strict-${{ inputs.os }}
+      - name: results
+        if: always()
+        run: source tests/lib.sh && finish "strict / ${{ inputs.os }}"
 
-      - name: Verify Docker is disabled after action
-        run: |
-          echo "=== Testing Docker AFTER disabling ==="
-
-          echo "Checking group membership..."
-          groups | grep -v docker || echo "✅ Runner is not in docker group"
-
-          echo "Attempting docker ps (should fail - requires daemon)..."
-          if docker ps 2>&1; then
-            echo "❌ ERROR: Docker ps still works! It should have been disabled."
-            exit 1
-          else
-            echo "✅ SUCCESS: docker ps correctly blocked"
-          fi
-
-          echo "Attempting docker info (should fail - requires daemon)..."
-          if docker info 2>&1; then
-            echo "❌ ERROR: Docker info still works! It should have been disabled."
-            exit 1
-          else
-            echo "✅ SUCCESS: docker info correctly blocked"
-          fi
-
-          echo "Note: docker --version still works (client-only command, doesn't need daemon)"
-          docker --version || true
-
-      - name: Verify sudo still works
-        run: |
-          echo "=== Testing sudo access (should still work) ==="
-          sudo whoami
-          sudo cat /etc/os-release
-          echo "✅ Sudo access still works (disable-docker doesn't affect sudo)"
-
-      - name: Verify other group memberships intact
-        run: |
-          echo "=== Testing other group access (should still work) ==="
-          # Runner user should still be in other groups
-          groups
-          echo ""
-          echo "Checking specific groups..."
-          groups | grep adm && echo "✅ Still in adm group" || echo "❌ Not in adm group"
-          groups | grep sudo && echo "✅ Still in sudo group" || echo "❌ Not in sudo group"
-
-          # Test log file access (adm group)
-          ls -la /var/log/syslog
-          echo "✅ Log file access still works (runner user still in adm group)"
-
-  test-stop-docker:
-    name: Test Stop Docker Feature
+  # T9: the controls survive their own processes being killed. enforce + sudo retained (ADVISORY)
+  # so the checks can SIGKILL the units; fail-on-tampering off because we disrupt on purpose.
+  crash-recovery:
+    if: ${{ inputs.only == 'all' || inputs.only == 'crash' }}
+    name: crash-recovery (enforce, sudo retained)
     runs-on: ${{ inputs.os }}
+    timeout-minutes: 20
     steps:
-      - name: Verify Docker service is running before action
-        run: |
-          echo "=== Testing Docker service BEFORE stopping ==="
-          sudo systemctl status docker --no-pager
-          sudo systemctl status docker.socket --no-pager
-          docker --version
-          docker ps
-          echo "✅ Docker service is running"
-
-      - name: Apply Safer Runner Action with stop-docker
+      - name: safer-runner (enforce, sudo retained so the checks can kill the units)
         uses: portswigger-tim/safer-runner-action@main
         with:
-          mode: 'analyze'
-          stop-docker: 'true'
-
-      - name: Verify Docker service is completely stopped
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
+          disable-sudo: false
+          fail-on-tampering: false
+      - uses: actions/checkout@v7
+      - name: SIGKILL proxy + CoreDNS; assert restart, CA reuse, egress + enforcement recover
+        run: tests/checks.sh crash-recovery || true
+      - name: results
+        if: always()
+        run: source tests/lib.sh && finish "crash-recovery / ${{ inputs.os }}"
+      - name: evidence
+        if: always()
         run: |
-          echo "=== Testing Docker service AFTER stopping ==="
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          sudo journalctl -u safer-runner-proxy --no-pager > evidence/proxy-journal.txt 2>&1 || true
+          sudo journalctl -u safer-runner-dns --no-pager > evidence/dns-journal.txt 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: evidence-crash-recovery-${{ inputs.os }}
+          path: evidence/
+          retention-days: 7
 
-          echo "Checking docker.service status (should be inactive with exit code 3)..."
-          sudo systemctl status docker --no-pager || DOCKER_EXIT=$?
-          echo "docker.service exit code: $DOCKER_EXIT"
-          if [ "$DOCKER_EXIT" -eq 3 ]; then
-            echo "✅ docker.service is stopped (exit code 3 = not running)"
-          else
-            echo "❌ ERROR: docker.service exit code is $DOCKER_EXIT (expected 3 for stopped service)"
-            exit 1
-          fi
-
-          echo "Checking docker.socket status (should be inactive with exit code 3)..."
-          sudo systemctl status docker.socket --no-pager || SOCKET_EXIT=$?
-          echo "docker.socket exit code: $SOCKET_EXIT"
-          if [ "$SOCKET_EXIT" -eq 3 ]; then
-            echo "✅ docker.socket is stopped (exit code 3 = not running)"
-          else
-            echo "❌ ERROR: docker.socket exit code is $SOCKET_EXIT (expected 3 for stopped service)"
-            exit 1
-          fi
-
-          echo "Attempting docker ps (should fail - no daemon)..."
-          if timeout 5 docker ps 2>&1; then
-            echo "❌ ERROR: Docker daemon is still accessible!"
-            exit 1
-          else
-            echo "✅ SUCCESS: Docker daemon is not accessible"
-          fi
-
-          echo "Attempting docker info (should fail - no daemon)..."
-          if timeout 5 docker info 2>&1; then
-            echo "❌ ERROR: Docker daemon info is still accessible!"
-            exit 1
-          else
-            echo "✅ SUCCESS: Docker daemon info not accessible"
-          fi
-
-          echo "Note: docker --version still works (client-only command):"
-          docker --version || true
-
-      - name: Verify sudo still works
-        run: |
-          echo "=== Testing sudo access (should still work) ==="
-          sudo whoami
-          sudo cat /etc/os-release
-          echo "✅ Sudo access still works (stop-docker doesn't affect sudo)"
-
-      - name: Summary
-        run: |
-          echo "=== Stop Docker Summary ==="
-          echo "✅ Docker service: STOPPED AND DISABLED"
-          echo "✅ Docker socket: STOPPED AND DISABLED"
-          echo "✅ Docker daemon: NOT ACCESSIBLE"
-          echo "✅ Sudo access: FUNCTIONAL"
-          echo ""
-          echo "This completely prevents Docker/container usage, including daemon access."
-
-  test-combined-lockdown:
-    name: Test Combined Lockdown (Sudo + Docker Disabled)
+  # Container egress. ADVISORY (sudo + docker kept) so the checks can drive docker and poke
+  # the rules; a service container started by the runner BEFORE the action exercises F1.
+  containers:
+    if: ${{ inputs.only == 'all' || inputs.only == 'containers' }}
+    name: containers (enforce, docker kept)
     runs-on: ${{ inputs.os }}
+    timeout-minutes: 30
+    # Service-container egress probe: tests/probe.py, base64, run by the health-cmd every 5s.
+    # (Workflow env is not available in services, hence inline; the anchor is reused below.)
+    services: &probe-service
+      svc:
+        image: python:3.12-slim
+        env:
+          PROBE: IyBTZXJ2aWNlLWNvbnRhaW5lciBlZ3Jlc3MgcHJvYmUgKHJ1biBieSB0aGUgc2VydmljZSdzIGhlYWx0aC1jbWQgZXZlcnkgZmV3IHNlY29uZHMpLgppbXBvcnQgc29ja2V0LCBzc2wsIHRpbWUsIHVybGxpYi5yZXF1ZXN0CmRlZiB0KG5hbWUsIGZuKToKICAgIHRyeToKICAgICAgICByID0gZm4oKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHIgPSAiRVJSICIgKyB0eXBlKGUpLl9fbmFtZV9fICsgIjogIiArIHN0cihlKVs6OTBdCiAgICBwcmludCh0aW1lLnN0cmZ0aW1lKCIlSDolTTolUyIpLCBuYW1lLCByLCBmbHVzaD1UcnVlKQp0KCJkbnMtZXhhbXBsZS5vcmciLCBsYW1iZGE6IHNvY2tldC5nZXRob3N0YnluYW1lKCJleGFtcGxlLm9yZyIpKQp0KCJodHRwcy1leGFtcGxlLm9yZyIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9leGFtcGxlLm9yZyIsIHRpbWVvdXQ9Nikuc3RhdHVzKQp0KCJodHRwLWV4YW1wbGUub3JnIiwgbGFtYmRhOiB1cmxsaWIucmVxdWVzdC51cmxvcGVuKCJodHRwOi8vZXhhbXBsZS5vcmciLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgiaHR0cHMtZ2l0aHViLmNvbSIsIGxhbWJkYTogdXJsbGliLnJlcXVlc3QudXJsb3BlbigiaHR0cHM6Ly9naXRodWIuY29tL3JvYm90cy50eHQiLCB0aW1lb3V0PTYpLnN0YXR1cykKdCgidGNwLTEuMS4xLjE6ODUzIiwgbGFtYmRhOiBzb2NrZXQuY3JlYXRlX2Nvbm5lY3Rpb24oKCIxLjEuMS4xIiwgODUzKSwgdGltZW91dD01KS5jbG9zZSgpIG9yICJjb25uZWN0ZWQiKQo=
+        volumes:
+          - /tmp/svcout:/out
+        options: >-
+          -i --health-cmd "echo $PROBE | base64 -d | python3 >> /out/log 2>&1; true"
+          --health-interval 5s --health-timeout 45s --health-retries 10000
     steps:
-      - name: Verify both sudo and Docker work before action
-        run: |
-          echo "=== Testing BEFORE combined lockdown ==="
-          echo "Sudo test:"
-          sudo whoami
-          echo "Docker test:"
-          docker --version
-          docker ps
-          echo "✅ Both sudo and Docker are working"
-
-      - name: Apply Safer Runner Action with combined lockdown
+      - name: safer-runner (enforce, sudo + docker kept)
         uses: portswigger-tim/safer-runner-action@main
         with:
-          mode: 'enforce'
-          disable-sudo: 'true'
-          disable-docker: 'true'
-          allowed-domains: 'httpbin.org'
-
-      - name: Verify both sudo and Docker are disabled
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+          passthrough-domains: ${{ env.PASSTHROUGH }}
+          disable-sudo: false
+          docker: keep
+          fail-on-tampering: false
+      - uses: actions/checkout@v7
+      - name: F1 - docker pull after a pre-action service pull
+        run: tests/containers.sh pull || true
+      - name: service container by name
+        run: tests/containers.sh service ${{ job.services.svc.id }} || true
+      - name: traffic (G1-G3, T1-T3, T5-T7)
+        run: tests/containers.sh traffic || true
+      - name: container DNS (N1-N3)
+        run: tests/containers.sh dns || true
+      - name: posture sni-only (no CA) + host still intercepted
+        run: tests/containers.sh posture || true
+      - name: multi-tenant front door stays intercepted
+        run: tests/containers.sh front-door enforce || true
+      - name: docker build RUN
+        run: tests/containers.sh build || true
+      - name: fail-closed (T4)
+        run: tests/containers.sh failclosed || true
+      - name: survives a dockerd restart (T8)
+        run: tests/containers.sh restart || true
+      - name: results
+        if: always()
+        run: source tests/lib.sh && finish "containers / ${{ inputs.os }}"
+      - name: evidence
+        if: always()
         run: |
-          echo "=== Testing AFTER combined lockdown ==="
-
-          echo "Checking sudo (should fail)..."
-          if sudo whoami 2>&1; then
-            echo "❌ ERROR: Sudo still works!"
-            exit 1
-          else
-            echo "✅ Sudo is correctly disabled"
-          fi
-
-          echo "Checking Docker daemon access (should fail)..."
-          if docker ps 2>&1; then
-            echo "❌ ERROR: Docker ps still works!"
-            exit 1
-          else
-            echo "✅ docker ps correctly blocked"
-          fi
-
-          if docker info 2>&1; then
-            echo "❌ ERROR: Docker info still works!"
-            exit 1
-          else
-            echo "✅ docker info correctly blocked"
-          fi
-
-          echo "Checking group membership..."
-          groups
-          groups | grep -v docker || echo "✅ Not in docker group"
-
-          echo "Note: docker --version (client-only) still works:"
-          docker --version || true
-
-      - name: Verify workflow can still function
-        run: |
-          echo "=== Testing workflow functionality without elevated privileges ==="
-
-          echo "Testing network access to allowed domain..."
-          curl -I https://httpbin.org/get || { echo "❌ Network access failed"; exit 1; }
-          echo "✅ Network access works"
-
-          echo "Testing basic commands..."
-          whoami
-          pwd
-          ls -la
-          echo "Hello from locked-down runner" > test.txt
-          cat test.txt
-          echo "✅ Basic commands work"
-
-          echo "Testing unauthorized domain is blocked..."
-          timeout 5 curl -I https://example.com && echo "❌ Unauthorized domain allowed!" || echo "✅ Unauthorized domain blocked"
-
-      - name: Summary
-        run: |
-          echo "=== Combined Lockdown Summary ==="
-          echo "✅ Sudo access: DISABLED"
-          echo "✅ Docker access: DISABLED"
-          echo "✅ Network filtering: ACTIVE (enforce mode)"
-          echo "✅ Workflow execution: FUNCTIONAL"
-          echo ""
-          echo "This demonstrates maximum security for workflows that don't need elevated privileges or containers."
-
-  # --- Added for Ubuntu 26.04 / sudo-rs and the GitHub egress DNS resolver ---
-  # These cover ground the original jobs did not: sudo-config allow/deny,
-  # invalid-config rejection, sudo-rs wildcard handling, and dnsmasq coexisting
-  # with a resolver already on :53 (systemd-resolved @127.0.0.53 or GitHub's
-  # egress-dns-resolver @127.0.0.100 - see actions/runner-images#14925).
-
-  test-invalid-sudo-config:
-    name: Invalid sudo-config fails fast (${{ inputs.os }})
-    runs-on: ${{ inputs.os }}
-    steps:
-      - name: Apply with clearly invalid sudoers (must fail)
-        id: apply
-        continue-on-error: true
-        uses: portswigger-tim/safer-runner-action@main
+          mkdir -p evidence; cp /var/log/safer-runner/*.json* /var/log/safer-runner/*.log evidence/ 2>/dev/null || true
+          cp /tmp/svcout/log evidence/svc-probe.log 2>/dev/null || true
+          sudo iptables-save > evidence/iptables-save.txt 2>&1 || true
+          sudo journalctl -u docker --no-pager -n 200 > evidence/dockerd.txt 2>&1 || true
+          sudo journalctl -u safer-runner-proxy --no-pager > evidence/proxy-journal.txt 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
         with:
-          mode: 'enforce'
-          sudo-config: 'this is not valid sudoers syntax at all'
-      - name: Assert the action rejected it
-        run: |
-          if [ "${{ steps.apply.outcome }}" != "failure" ]; then
-            echo "::error::invalid sudo-config should have failed the action"; exit 1
-          fi
-          echo "invalid sudo-config correctly rejected on ${{ inputs.os }}"
+          name: evidence-containers-${{ inputs.os }}
+          path: evidence/
+          retention-days: 7
 
-  report-embedded-wildcard-sudo-config:
-    name: Embedded-wildcard sudo-config (informational, ${{ inputs.os }})
+  # Default enforce (docker + sudo removed from steps): the service container is still contained.
+  containers-default:
+    if: ${{ inputs.only == 'all' || inputs.only == 'containers' }}
+    name: containers (default enforce)
     runs-on: ${{ inputs.os }}
+    timeout-minutes: 20
+    services: *probe-service
     steps:
-      - name: Apply with an embedded wildcard in command args
-        id: embedded
-        continue-on-error: true
-        uses: portswigger-tim/safer-runner-action@main
+      - uses: portswigger-tim/safer-runner-action@main
         with:
-          mode: 'enforce'
-          sudo-config: 'runner ALL=(root) NOPASSWD: /usr/sbin/iptables -L * -n --line-numbers'
-      - name: Report how this runner's sudo handled it
-        run: |
-          echo "${{ inputs.os }}: embedded-wildcard outcome = ${{ steps.embedded.outcome }}"
-          echo "(classic sudo accepts embedded wildcards; sudo-rs rejects them. Informational - never fails.)"
+          mode: enforce
+          allowed-domains: ${{ env.ALLOWED }}
+      - uses: actions/checkout@v7
+      - name: service container contained (health-cmd probe)
+        run: tests/containers.sh probe-log || true
+      - name: results
+        if: always()
+        run: source tests/lib.sh && finish "containers-default / ${{ inputs.os }}"
 
-  test-dns-resolution-and-coexistence:
-    name: dnsmasq resolves and coexists on :53 (${{ inputs.os }})
+  # analyze must not break containers; F1 also applies in analyze
+  containers-analyze:
+    if: ${{ inputs.only == 'all' || inputs.only == 'containers' }}
+    name: containers (analyze)
     runs-on: ${{ inputs.os }}
+    timeout-minutes: 20
+    services: *probe-service
     steps:
-      - name: Resolvers before the action
-        run: |
-          . /etc/os-release && echo "OS: $PRETTY_NAME"
-          echo "resolv.conf:"; cat /etc/resolv.conf || true
-          echo ":53 listeners before:"; sudo ss -lntup 'sport = :53' || true
-      - name: Apply Safer Runner Action (enforce)
-        uses: portswigger-tim/safer-runner-action@main
+      - uses: portswigger-tim/safer-runner-action@main
         with:
-          mode: 'enforce'
-          allowed-domains: 'api.github.com'
-      - name: dnsmasq is on 127.0.0.1 and an allowed domain resolves
-        run: |
-          echo ":53 listeners after (dnsmasq should be on 127.0.0.1; another resolver may hold 127.0.0.53/127.0.0.100):"
-          sudo ss -lntup 'sport = :53' || true
-          ans=$(dig +short +time=5 +tries=2 @127.0.0.1 api.github.com A || true)
-          echo "api.github.com A -> ${ans:-<empty>}"
-          if [ -z "$ans" ]; then
-            echo "::error::dnsmasq up but did not resolve an allowed domain (upstream/egress issue?)"; exit 1
-          fi
-      - name: Direct-IP egress is blocked in enforce mode (clean, no harden-runner)
-        run: |
-          # Enforce mode must block DNS/HTTP straight to an arbitrary external IP,
-          # independent of dnsmasq. This is a pure safer-runner check.
-          echo "default route: $(ip route show default || true)"
-          echo "iptables OUTPUT:"; sudo iptables -S OUTPUT || true
-          fail=0
-          if timeout 3 dig +time=2 +tries=1 @8.8.8.8 google.com +short | grep -qE '^[0-9]+\.'; then
-            echo "::error::direct-IP DNS to 8.8.8.8 was NOT blocked in enforce mode"; fail=1
-          else
-            echo "direct-IP DNS to 8.8.8.8 blocked as expected"
-          fi
-          if timeout 5 curl -sS -o /dev/null --max-time 4 https://1.1.1.1; then
-            echo "::error::direct-IP HTTPS to 1.1.1.1 was NOT blocked in enforce mode"; fail=1
-          else
-            echo "direct-IP HTTPS to 1.1.1.1 blocked as expected"
-          fi
-          exit $fail
-
-  test-custom-dns-enforce:
-    name: custom DNS server works in enforce mode (${{ inputs.os }})
-    runs-on: ${{ inputs.os }}
-    steps:
-      - name: Apply Safer Runner Action (enforce; custom primary DNS, empty secondary)
-        uses: portswigger-tim/safer-runner-action@main
-        with:
-          mode: 'enforce'
-          allowed-domains: 'example.com'
-          primary-dns-server: '1.1.1.1'
-          secondary-dns-server: ''
-      - name: Allowed domain resolves via the custom upstream (M1 regression guard)
-        run: |
-          echo "iptables OUTPUT DNS allows (should target 1.1.1.1, not Quad9):"
-          sudo iptables -S OUTPUT | grep -E 'dport 53' || true
-          ans=$(dig +short +time=5 +tries=2 @127.0.0.1 example.com A || true)
-          echo "example.com A -> ${ans:-<empty>}"
-          if [ -z "$ans" ]; then
-            echo "::error::enforce+custom DNS failed to resolve an allowed domain (M1 regressed)"; exit 1
-          fi
-          if sudo iptables -S OUTPUT | grep -qE '9\.9\.9\.9.*dport 53'; then
-            echo "::warning::firewall still allows Quad9 DNS despite a custom primary"
-          fi
+          mode: analyze
+      - uses: actions/checkout@v7
+      - name: F1 in analyze
+        run: tests/containers.sh pull || true
+      - name: no container breakage
+        run: tests/containers.sh analyze || true
+      - name: front door passes through in analyze
+        run: tests/containers.sh front-door analyze || true
+      - name: results
+        if: always()
+        run: source tests/lib.sh && finish "containers-analyze / ${{ inputs.os }}"
