@@ -615,7 +615,9 @@ http_filter() {
   render_report || return
   report_has HF.report-invalid-method '`INVALID`' "a non-standard method is shown as INVALID"
   ! grep -q SRTCANARY "$REPORT" "${REPORT%.md}.log"; pass_if HF.report-no-method-token $? "the method token appears nowhere in the report or the post-step log"
-  report_has HF.report-refused '### 🔒 Refused by `http-filter`' "enforce report lists the refused requests"
+  report_has HF.report-refused '**Refused by `http-filter`**' "enforce report lists the refused requests"
+  grep -qE '^\| ⛔ \| HTTP filter \| [0-9]+ requests? blocked: ' "$REPORT"
+  pass_if HF.report-scorecard $? "the Summary scorecard has a blocked HTTP filter row: $(grep -m1 '| HTTP filter |' "$REPORT" | cut -c1-160)"
   # refused paths are never shown (the sender chose them; they can carry data): the refused
   # requests' canary path segments must not appear in the report or the post-step log
   report_has HF.report-path-hidden '‹path hidden›' "a refused request's path is shown as hidden"
@@ -728,6 +730,20 @@ http_filter_no_platform_audit() {
   [ -z "$rec" ]; pass_if HN.no-platform-allows $? "no request allowed as platform: ${rec:-none}"
 }
 
+# The suggested http-filter value (the input's YAML: host -> path -> methods) from $REPORT:
+# the `http-filter` input of the Suggested Enforce Configuration block, or, when the job sets
+# none, the optional block under it. Empty when there is none.
+suggested_http_filter() {
+  local section v
+  section=$(sed -n '/^## 🔧 Suggested Enforce Configuration$/,/^# 🔎 Detail$/p' "$REPORT")
+  v=$(awk '/^```yaml$/{f=1;next} /^```$/{if(f)exit} f' <<<"$section" | yq '.[0].with["http-filter"] // ""' 2>/dev/null)
+  if [ -z "$v" ]; then
+    v=$(sed -n '/<summary>Optional: narrow the allowed hosts further with <code>http-filter<\/code>/,/<\/details>/p' <<<"$section" \
+      | awk '/^```yaml$/{f=1;next} /^```$/{if(f)exit} f' | yq '.["http-filter"] // ""' 2>/dev/null)
+  fi
+  printf '%s' "$v"
+}
+
 # analyze job, http-filter: api.github.com { "*": GET, HEAD }; github.com { "*": "*", "*/git-receive-pack": NONE }
 http_filter_analyze() {
   expect_passed HZ.api-post-would-block "POST api.github.com/markdown (analyze: allowed, logged)" \
@@ -743,13 +759,18 @@ http_filter_analyze() {
   render_report || return
   report_has HZ.report-invalid-method '`INVALID`' "a non-standard method is shown as INVALID"
   ! grep -q SRTCANARY "$REPORT" "${REPORT%.md}.log"; pass_if HZ.report-no-method-token $? "the method token appears nowhere in the report or the post-step log"
-  ! sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -q 'INVALID'
+  # the suggested http-filter: in the Suggested Enforce Configuration block when the job sets
+  # one, else the optional <details> under it (render_report passes no INPUT_HTTP-FILTER)
+  local sug
+  sug=$(suggested_http_filter)
+  [ -n "$sug" ]; pass_if HZ.report-suggested $? "analyze report suggests an http-filter: $(head -c 200 <<<"$sug" | tr '\n' ' ')"
+  [ -n "$sug" ] && ! grep -q 'INVALID' <<<"$sug"
   pass_if HZ.suggestion-no-invalid $? "the suggested http-filter has no INVALID method"
-  report_has HZ.report-refused '### 🔒 Refused by `http-filter`' "analyze report lists what the filter would refuse"
-  report_has HZ.report-would-block '— would be blocked' "labelled as would-be-blocked"
-  report_has HZ.report-suggested 'Suggested <code>http-filter</code>' "analyze report has a suggested http-filter"
-  sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -q 'api.github.com'
-  pass_if HZ.report-suggested-api $? "suggestion covers api.github.com: $(sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -A3 'api.github.com' | tr '\n' ' ' | cut -c1-200)"
+  grep -q '^api\.github\.com:' <<<"$sug"
+  pass_if HZ.report-suggested-api $? "suggestion covers api.github.com: $(grep -A3 '^api.github.com:' <<<"$sug" | tr '\n' ' ' | cut -c1-200)"
+  report_has HZ.report-refused '**Would be refused by `http-filter`**' "analyze report lists what the filter would refuse"
+  grep -qE '^\| 🟠 \| HTTP filter \| [0-9]+ requests? would be blocked: ' "$REPORT"
+  pass_if HZ.report-would-block $? "labelled as would-be-blocked in the scorecard: $(grep -m1 '| HTTP filter |' "$REPORT" | cut -c1-160)"
 }
 
 # enforce job: a broad github.com baseline with repo-specific push denies:
