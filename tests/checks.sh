@@ -615,13 +615,16 @@ http_filter() {
   render_report || return
   report_has HF.report-invalid-method '`INVALID`' "a non-standard method is shown as INVALID"
   ! grep -q SRTCANARY "$REPORT" "${REPORT%.md}.log"; pass_if HF.report-no-method-token $? "the method token appears nowhere in the report or the post-step log"
-  report_has HF.report-refused '### 🔒 Refused by `http-filter`' "enforce report lists the refused requests"
+  report_has HF.report-blocked '#### Blocked' "enforce report has the Blocked table"
+  grep -qE '^\| `method-not-allowed` \| http-filter \| [0-9]+ \| `api\.github\.com` `INVALID` ‹path hidden› \|$' "$REPORT"
+  pass_if HF.report-refused $? "the Blocked table has the refused request, with its reason and layer: $(grep -m1 '| http-filter |' "$REPORT" | cut -c1-160)"
   # refused paths are never shown (the sender chose them; they can carry data): the refused
   # requests' canary path segments must not appear in the report or the post-step log
   report_has HF.report-path-hidden '‹path hidden›' "a refused request's path is shown as hidden"
   ! grep -qE 'srt-does-not-exist|srt-http-filter-probe' "$REPORT" "${REPORT%.md}.log"
   pass_if HF.report-no-refused-path $? "no refused path (DELETE …/srt-does-not-exist-*, npm PUT /srt-http-filter-probe-*) in the report or the post-step log"
-  report_has HF.report-analyze-note "run it in analyze mode without that host's \`http-filter\` entry" "enforce report says how to allow a needed request"
+  # a filter built from the allowed requests never allows a blocked one: enforce suggests none
+  ! grep -q 'http-filter: |' "$REPORT"; pass_if HF.report-no-filter-suggestion $? "enforce report suggests no http-filter"
 }
 
 # Platform hosts the runner and first-party actions talk to.
@@ -707,7 +710,7 @@ http_filter_split_audit() {
   echo "::notice title=HS refused platform requests ($SPLIT)::${all:-none}"
   if [ -n "${essential:-}" ]; then
     render_report || return
-    report_has HS.report-platform "$essential GitHub platform endpoints auto-allowed" "report shows the essential platform count"
+    report_has HS.report-platform "· $essential platform endpoint" "report shows the essential platform count (GitHub, always allowed)"
   fi
 }
 
@@ -728,6 +731,13 @@ http_filter_no_platform_audit() {
   [ -z "$rec" ]; pass_if HN.no-platform-allows $? "no request allowed as platform: ${rec:-none}"
 }
 
+# The suggested http-filter value (the input's YAML: host -> path -> methods) from $REPORT: the
+# `http-filter` input of the uses: block under "#### For enforce". Empty when there is none.
+suggested_http_filter() {
+  sed -n '/^#### For enforce$/,$p' "$REPORT" | awk '/^```yaml$/{f=1;next} /^```$/{if(f)exit} f' \
+    | yq '.[0].with["http-filter"] // ""' 2>/dev/null
+}
+
 # analyze job, http-filter: api.github.com { "*": GET, HEAD }; github.com { "*": "*", "*/git-receive-pack": NONE }
 http_filter_analyze() {
   expect_passed HZ.api-post-would-block "POST api.github.com/markdown (analyze: allowed, logged)" \
@@ -743,13 +753,17 @@ http_filter_analyze() {
   render_report || return
   report_has HZ.report-invalid-method '`INVALID`' "a non-standard method is shown as INVALID"
   ! grep -q SRTCANARY "$REPORT" "${REPORT%.md}.log"; pass_if HZ.report-no-method-token $? "the method token appears nowhere in the report or the post-step log"
-  ! sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -q 'INVALID'
+  # the suggested http-filter is in the one uses: block under For enforce
+  local sug
+  sug=$(suggested_http_filter)
+  [ -n "$sug" ]; pass_if HZ.report-suggested $? "analyze report suggests an http-filter: $(head -c 200 <<<"$sug" | tr '\n' ' ')"
+  [ -n "$sug" ] && ! grep -q 'INVALID' <<<"$sug"
   pass_if HZ.suggestion-no-invalid $? "the suggested http-filter has no INVALID method"
-  report_has HZ.report-refused '### 🔒 Refused by `http-filter`' "analyze report lists what the filter would refuse"
-  report_has HZ.report-would-block '— would be blocked' "labelled as would-be-blocked"
-  report_has HZ.report-suggested 'Suggested <code>http-filter</code>' "analyze report has a suggested http-filter"
-  sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -q 'api.github.com'
-  pass_if HZ.report-suggested-api $? "suggestion covers api.github.com: $(sed -n '/Suggested <code>http-filter/,/<\/details>/p' "$REPORT" | grep -A3 'api.github.com' | tr '\n' ' ' | cut -c1-200)"
+  grep -q '^api\.github\.com:' <<<"$sug"
+  pass_if HZ.report-suggested-api $? "suggestion covers api.github.com: $(grep -A3 '^api.github.com:' <<<"$sug" | tr '\n' ' ' | cut -c1-200)"
+  report_has HZ.report-would-block '#### Enforce would block' "analyze report has the Enforce would block table"
+  grep -qE '^\| `(method|path)-not-allowed` \| http-filter \| [0-9]+ \| `api\.github\.com` ' "$REPORT"
+  pass_if HZ.report-refused $? "the table lists what the filter would block: $(grep -m1 '| http-filter |' "$REPORT" | cut -c1-160)"
 }
 
 # enforce job: a broad github.com baseline with repo-specific push denies:
