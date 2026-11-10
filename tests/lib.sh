@@ -119,7 +119,7 @@ expect_passed() {
 
 # render_report: run the action's own post-step reporter now, with the job's inputs, into
 # $REPORT, so a step can assert on the summary the real post step will publish at job end.
-# (All it changes is deleting the CA key on disk early; the running proxy keeps it in memory.)
+# (It changes nothing on the runner: the post step leaves the proxy and its CA key alone.)
 render_report() {
   local js
   js=$(ls -d "$RUNNER_WORKSPACE"/../_actions/portswigger-tim/safer-runner-action/*/dist/post/index.js 2>/dev/null | head -1)
