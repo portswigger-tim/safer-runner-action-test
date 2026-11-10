@@ -50,7 +50,7 @@ jobs:
       - name: safer-runner in a job container
         id: sr
         continue-on-error: true
-        uses: portswigger-tim/safer-runner-action@25fa35b083702be6173a8dfff723907c66000cc0 # v2.5.1
+        uses: portswigger-tim/safer-runner-action@e7a4410b8713de3759dae8997ee1c0223863bba9 # v2.5.2
         with:
           mode: ${{ matrix.mode }}
       - name: results
@@ -74,7 +74,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: safer-runner (enforce)
-        uses: portswigger-tim/safer-runner-action@25fa35b083702be6173a8dfff723907c66000cc0 # v2.5.1
+        uses: portswigger-tim/safer-runner-action@e7a4410b8713de3759dae8997ee1c0223863bba9 # v2.5.2
         with:
           mode: enforce
           allowed-domains: 'api.github.com'
