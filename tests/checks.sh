@@ -520,6 +520,26 @@ JSON
   { [ $rc -ne 0 ] && grep -q " BLOCK A registry.internal-corp.attacker.example. " /var/log/safer-runner/dns.log; }
   pass_if SC5b.npm-dependency-confusion $? "npm --registry to attacker registry blocked (NXDOMAIN) [dependency-confusion replay]; rc=$rc ${out: -60}"
 
+  # SC6 - malicious agent-framework releases (PyPI, 17 Nov 2026; OX Security advisory: 1.26.1 and
+  # 1.26.2): the wheel's .pth hook runs at every interpreter start and spawns a detached child
+  # process that scrapes env-var secrets (matching the advisory's keyword list), gzips + base64-
+  # encodes them, and POSTs them to an external webhook, silencing every error. We stage the
+  # structural replica fixture (real .pth hook, real detached child, real encode+POST path - see
+  # tests/fixtures/sc-pth-replay/) in a site directory and load it exactly as site does at
+  # interpreter start. The canary vars are named to match the advisory's keywords (…TOKEN,
+  # …SECRET) but are FAKE and SR_-prefixed, so nothing the fixture can reach is a real credential,
+  # even if the egress control failed outright.
+  pkg=/tmp/sc-pth-site; rm -rf "$pkg"; mkdir -p "$pkg"
+  cp -r tests/fixtures/sc-pth-replay/. "$pkg/"
+  export SR_CANARY_TOKEN="$canary" SR_CANARY_SECRET="$canary"
+  out=$(python3 -c "import site; site.addsitedir('$pkg')" 2>&1); rc=$?
+  unset SR_CANARY_TOKEN SR_CANARY_SECRET
+  sleep 3
+  [ "$rc" -eq 0 ] \
+    && grep -qE " BLOCK A webhook-replay\.pth-replay\.attacker\.example\. " /var/log/safer-runner/dns.log \
+    && ! grep -qE "webhook-replay\.pth-replay\.attacker\.example\. .*upstream=" /var/log/safer-runner/dns.log
+  pass_if SC6.pth-hook $? "interpreter-start .pth hook spawned a detached child that scraped+gzip+base64-encoded its canary and POSTed it to webhook-replay.pth-replay.attacker.example: NXDOMAIN'd by default-deny DNS, never forwarded [malicious agent-framework 1.26.x replay]; python rc=$rc ${out: -60}"
+
   # Aggregate: across every replay above, the proxy never opened a server connection to the attacker IP.
   rc=$(jq -c "select(.ev==\"server-connect\" and (.peername // \"\" | startswith(\"$ATTACKER_IP:\")))" "$FLOWLOG" 2>/dev/null | wc -l)
   [ "$rc" -eq 0 ]; pass_if SC.no-egress-to-sink $? "$rc proxy server-connects to $ATTACKER_IP across all replays (want 0)"

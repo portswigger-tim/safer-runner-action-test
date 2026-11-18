@@ -1,8 +1,8 @@
 name: Attack replay (supply-chain)
 
 # Real-world supply-chain attack replays against safer-runner-action@main: reproduce the behaviour
-# of named 2024-2025 incidents (tj-actions/changed-files, Shai-Hulud npm worm, curl|bash stagers,
-# SUNBURST-style DNS tunnelling, dependency confusion) with FAKE canary secrets and self-contained
+# of named 2024-2026 incidents (tj-actions/changed-files, Shai-Hulud npm worm, curl|bash stagers,
+# SUNBURST-style DNS tunnelling, dependency confusion, malicious agent-framework .pth hook) with FAKE canary secrets and self-contained
 # non-allowlisted sinks, and prove enforce stops every exfil before anything leaves.
 # Default enforce (sudo + docker removed) = the real threat model: a malicious step running as the
 # runner user after the action has hardened egress. Checks: tests/checks.sh supply-chain.
