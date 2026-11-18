@@ -43,33 +43,33 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: safer-runner (enforce, platform hosts filtered to NONE)
-        uses: portswigger-tim/safer-runner-action@2be7ca7d730f0c724213815cb9ea1a86cb879f26 # v2.5.3
+        uses: portswigger-tim/safer-runner-action@v2.5.3
         with:
           mode: enforce
           http-filter: |
             run-actions-*-azure-*.actions.githubusercontent.com: { "*": NONE }
             ${{ matrix.split != 'blob' && 'results-receiver.actions.githubusercontent.com: { "*": NONE }' || '' }}
             ${{ matrix.split != 'receiver' && 'productionresultssa*.blob.core.windows.net: { "*": NONE }' || '' }}
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: OIDC + the filter is live on each filtered host
         run: tests/checks.sh http-filter-split || true
       - name: outlive a job-lease renewal (the runner renews about once a minute)
         run: sleep 75
       - run: mkdir -p art cache-dir && head -c 1000000 /dev/urandom > art/payload.bin && cp art/payload.bin cache-dir/
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.2
         id: up
         continue-on-error: true
         with:
           name: split-${{ matrix.split }}-${{ matrix.os }}
           path: art/payload.bin
           retention-days: 1
-      - uses: actions/cache/save@v6
+      - uses: actions/cache/save@v6.1.0
         continue-on-error: true
         with:
           path: cache-dir
           key: split-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.split }}-${{ matrix.os }}
       - run: sleep 10
-      - uses: actions/cache/restore@v6
+      - uses: actions/cache/restore@v6.1.0
         id: restore
         continue-on-error: true
         with:
